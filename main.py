@@ -33,8 +33,12 @@ class LighterSigningServiceGUI(ctk.CTk):
 
         # Service directory is bundled with the application
         if getattr(sys, 'frozen', False):
-            # Running as compiled executable
-            application_path = Path(sys.executable).parent
+            # Running as compiled executable (PyInstaller)
+            # PyInstaller extracts files to sys._MEIPASS
+            if hasattr(sys, '_MEIPASS'):
+                application_path = Path(sys._MEIPASS)
+            else:
+                application_path = Path(sys.executable).parent
         else:
             # Running as script
             application_path = Path(__file__).parent
@@ -350,69 +354,56 @@ class LighterSigningServiceGUI(ctk.CTk):
             self.log("Service is already running", "WARNING")
             return
 
-        if not self.service_dir.exists() or not (self.service_dir / "main.py").exists():
-            self.log("Service files not found. Cannot start service.", "ERROR")
-            return
-
         def start_task():
             try:
                 self.log("Starting service...", "INFO")
 
-                # Find the main service file
+                # Import and run uvicorn directly
+                import sys
+                import importlib.util
+
+                # Add service directory to path
+                service_path = str(self.service_dir)
+                if service_path not in sys.path:
+                    sys.path.insert(0, service_path)
+
+                # Import the service main module
                 main_file = self.service_dir / "main.py"
                 if not main_file.exists():
-                    # Try alternative names
-                    for name in ["app.py", "server.py", "service.py"]:
-                        alt_file = self.service_dir / name
-                        if alt_file.exists():
-                            main_file = alt_file
-                            break
-
-                if not main_file.exists():
-                    self.log("Could not find service entry point (main.py)", "ERROR")
+                    self.log("Service main.py not found", "ERROR")
                     return
 
-                # Start the service process
-                self.service_process = subprocess.Popen(
-                    [sys.executable, str(main_file)],
-                    cwd=str(self.service_dir),
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    bufsize=1
-                )
+                # Load the service module
+                spec = importlib.util.spec_from_file_location("service_main", main_file)
+                if spec is None or spec.loader is None:
+                    self.log("Failed to load service module", "ERROR")
+                    return
+
+                service_module = importlib.util.module_from_spec(spec)
+                sys.modules["service_main"] = service_module
 
                 self.service_running = True
                 self.update_ui_state()
+                self.log(f"Service starting on port {self.service_port}...", "INFO")
 
-                self.log(f"Service started on port {self.service_port}", "SUCCESS")
-
-                # Monitor service output
+                # Execute the service module (this will start uvicorn)
                 try:
-                    while self.service_running:
-                        process = self.service_process
-                        if not process:
-                            break
-
-                        # Check if process is still running
-                        if process.poll() is not None:
-                            break
-
-                        # Read output with timeout
-                        line = process.stdout.readline()
-                        if line:
-                            self.log(line.strip(), "SERVICE")
-                except Exception as read_error:
-                    self.log(f"Error reading service output: {str(read_error)}", "ERROR")
-
-                # Service stopped
-                if self.service_running:
+                    spec.loader.exec_module(service_module)
+                    self.log(f"Service started on port {self.service_port}", "SUCCESS")
+                except Exception as exec_error:
+                    self.log(f"Service execution error: {str(exec_error)}", "ERROR")
                     self.service_running = False
                     self.update_ui_state()
-                    self.log("Service stopped", "INFO")
+                    return
+
+                # Keep the service running
+                while self.service_running:
+                    time.sleep(0.1)
 
             except Exception as e:
                 self.log(f"Failed to start service: {str(e)}", "ERROR")
+                import traceback
+                self.log(traceback.format_exc(), "ERROR")
                 self.service_running = False
                 self.service_process = None
                 self.update_ui_state()
@@ -421,22 +412,12 @@ class LighterSigningServiceGUI(ctk.CTk):
 
     def stop_service(self):
         """Stop the HTTP service"""
-        if not self.service_running or self.service_process is None:
+        if not self.service_running:
             self.log("Service is not running", "WARNING")
             return
 
         try:
             self.log("Stopping service...", "INFO")
-            self.service_process.terminate()
-
-            # Wait for process to terminate
-            try:
-                self.service_process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                self.log("Force killing service...", "WARNING")
-                self.service_process.kill()
-                self.service_process.wait()
-
             self.service_running = False
             self.service_process = None
             self.update_ui_state()
