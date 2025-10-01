@@ -2,8 +2,44 @@
 import sys
 import os
 from pathlib import Path
+from PyInstaller.utils.hooks import collect_all, collect_submodules, collect_data_files
 
 block_cipher = None
+
+# Collect all data and metadata for eth packages
+datas = []
+hiddenimports = []
+binaries = []
+
+# Packages that need complete collection (code + data + metadata)
+packages_to_collect = [
+    'eth_account',
+    'eth_keys',
+    'eth_utils',
+    'eth_abi',
+    'eth_typing',
+    'eth_hash',
+    'eth_rlp',
+    'eth_keyfile',
+    'py_ecc',
+    'cytoolz',
+    'toolz',
+    'hexbytes',
+    'rlp',
+    'bitarray',
+    'parsimonious',
+    'Crypto',
+    'ecdsa',
+]
+
+for package in packages_to_collect:
+    try:
+        tmp_datas, tmp_binaries, tmp_hiddenimports = collect_all(package)
+        datas += tmp_datas
+        binaries += tmp_binaries
+        hiddenimports += tmp_hiddenimports
+    except Exception as e:
+        print(f"Warning: Could not collect {package}: {e}")
 
 # Collect all service files
 service_datas = [
@@ -30,9 +66,9 @@ elif sys.platform == 'linux':
 a = Analysis(
     ['main.py'],
     pathex=[],
-    binaries=[],
-    datas=service_datas,
-    hiddenimports=[
+    binaries=binaries,
+    datas=service_datas + datas,
+    hiddenimports=hiddenimports + [
         # CustomTkinter
         'customtkinter',
         'PIL',
