@@ -1,0 +1,229 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  build-macos:
+    runs-on: macos-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    - name: Verify service directory
+      run: |
+        echo "Checking service directory..."
+        ls -la service/
+        if [ ! -f "service/main.py" ]; then
+          echo "ERROR: service/main.py not found!"
+          exit 1
+        fi
+        echo "Service files verified ✓"
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install pyinstaller
+        echo "Installed packages:"
+        pip list
+
+    - name: Build macOS app
+      run: |
+        echo "Building macOS application..."
+        pyinstaller build.spec --clean --noconfirm
+        echo "Build completed!"
+        ls -la dist/
+    
+    - name: Create DMG
+      run: |
+        # Variables
+        APP_NAME="LighterSigningService"
+        VERSION="${GITHUB_REF#refs/tags/v}"
+        if [ -z "$VERSION" ] || [ "$VERSION" = "$GITHUB_REF" ]; then
+          VERSION="1.1.0"
+        fi
+        DMG_NAME="${APP_NAME}-${VERSION}-macOS"
+        DMG_DIR="dmg_temp"
+        VOLUME_NAME="Lighter Signing Service"
+        
+        # Create temporary directory
+        mkdir -p "${DMG_DIR}"
+        
+        # Copy app to temporary directory
+        cp -R "dist/${APP_NAME}.app" "${DMG_DIR}/"
+        
+        # Create Applications symlink
+        ln -s /Applications "${DMG_DIR}/Applications"
+        
+        # Create DMG
+        hdiutil create -volname "${VOLUME_NAME}" \
+          -srcfolder "${DMG_DIR}" \
+          -ov -format UDZO \
+          "dist/${DMG_NAME}.dmg"
+        
+        # Clean up
+        rm -rf "${DMG_DIR}"
+        
+        echo "DMG created: dist/${DMG_NAME}.dmg"
+        ls -lh dist/
+    
+    - name: Upload macOS artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: macos-dmg
+        path: dist/*.dmg
+        retention-days: 30
+
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    - name: Verify service directory
+      run: |
+        echo "Checking service directory..."
+        dir service\
+        if (-not (Test-Path "service\main.py")) {
+          echo "ERROR: service\main.py not found!"
+          exit 1
+        }
+        echo "Service files verified"
+      shell: pwsh
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install pyinstaller
+        echo "Installed packages:"
+        pip list
+
+    - name: Build Windows executable
+      run: |
+        echo "Building Windows application..."
+        pyinstaller build.spec --clean --noconfirm
+        echo "Build completed!"
+        dir dist\
+    
+    - name: Create installer with Inno Setup
+      run: |
+        # Install Inno Setup
+        echo "Installing Inno Setup..."
+        choco install innosetup -y
+
+        # Get version from tag or use default
+        $version = "$env:GITHUB_REF" -replace 'refs/tags/v', ''
+        if ([string]::IsNullOrEmpty($version) -or $version -eq $env:GITHUB_REF) {
+          $version = "1.1.0"
+        }
+        echo "Version: $version"
+
+        # Create Inno Setup script
+        $issContent = @"
+        #define MyAppName "Lighter Signing Service"
+        #define MyAppVersion "$version"
+        #define MyAppPublisher "AlphaAI Labs"
+        #define MyAppURL "https://github.com/AlphaAILabs/lighter-signing-service"
+        #define MyAppExeName "LighterSigningService.exe"
+
+        [Setup]
+        AppId={{A8B9C0D1-E2F3-4A5B-6C7D-8E9F0A1B2C3D}
+        AppName={#MyAppName}
+        AppVersion={#MyAppVersion}
+        AppPublisher={#MyAppPublisher}
+        AppPublisherURL={#MyAppURL}
+        DefaultDirName={autopf}\{#MyAppName}
+        DefaultGroupName={#MyAppName}
+        AllowNoIcons=yes
+        OutputDir=dist
+        OutputBaseFilename=LighterSigningService-{#MyAppVersion}-Windows-Setup
+        Compression=lzma
+        SolidCompression=yes
+        WizardStyle=modern
+        PrivilegesRequired=lowest
+        ArchitecturesAllowed=x64
+        ArchitecturesInstallIn64BitMode=x64
+
+        [Languages]
+        Name: "english"; MessagesFile: "compiler:Default.isl"
+        Name: "chinesesimplified"; MessagesFile: "compiler:Languages\ChineseSimplified.isl"
+
+        [Tasks]
+        Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
+
+        [Files]
+        Source: "dist\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
+
+        [Icons]
+        Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
+        Name: "{group}\{cm:UninstallProgram,{#MyAppName}}"; Filename: "{uninstallexe}"
+        Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
+
+        [Run]
+        Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#MyAppName}}"; Flags: nowait postinstall skipifsilent
+        "@
+
+        $issContent | Out-File -FilePath "installer.iss" -Encoding UTF8
+
+        # Compile installer
+        echo "Compiling installer..."
+        & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer.iss
+
+        # List output files
+        echo "Build artifacts:"
+        Get-ChildItem dist\
+      shell: pwsh
+    
+    - name: Upload Windows artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: windows-installer
+        path: |
+          dist/*.exe
+          dist/*-Setup.exe
+        retention-days: 30
+
+  create-release:
+    needs: [build-macos, build-windows]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    
+    steps:
+    - name: Download all artifacts
+      uses: actions/download-artifact@v4
+      with:
+        path: artifacts
+    
+    - name: Create Release
+      uses: softprops/action-gh-release@v1
+      with:
+        files: |
+          artifacts/macos-dmg/*.dmg
+          artifacts/windows-installer/*-Setup.exe
+        draft: false
+        prerelease: false
+        generate_release_notes: true
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
