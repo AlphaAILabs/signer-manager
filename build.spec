@@ -1,5 +1,6 @@
 # -*- mode: python ; coding: utf-8 -*-
 import sys
+import os
 from pathlib import Path
 
 block_cipher = None
@@ -9,11 +10,22 @@ service_datas = [
     ('service/main.py', 'service'),
     ('service/requirements.txt', 'service'),
     ('service/README.md', 'service'),
-    ('service/signers/signer-arm64.dylib', 'service/signers'),
-    ('service/signers/signer-amd64.so', 'service/signers'),
-    ('service/signers/signer-amd64.dll', 'service/signers'),
     ('service/signers/README.md', 'service/signers'),
 ]
+
+# Add platform-specific signer files only if they exist
+if sys.platform == 'darwin':
+    # macOS
+    if os.path.exists('service/signers/signer-arm64.dylib'):
+        service_datas.append(('service/signers/signer-arm64.dylib', 'service/signers'))
+elif sys.platform == 'win32':
+    # Windows
+    if os.path.exists('service/signers/signer-amd64.dll'):
+        service_datas.append(('service/signers/signer-amd64.dll', 'service/signers'))
+elif sys.platform == 'linux':
+    # Linux
+    if os.path.exists('service/signers/signer-amd64.so'):
+        service_datas.append(('service/signers/signer-amd64.so', 'service/signers'))
 
 a = Analysis(
     ['main.py'],
