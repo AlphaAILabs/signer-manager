@@ -30,6 +30,7 @@ class LighterSigningServiceGUI(ctk.CTk):
         # Service state
         self.service_process: Optional[subprocess.Popen] = None
         self.service_running = False
+        self.uvicorn_server = None
 
         # Service directory is bundled with the application
         if getattr(sys, 'frozen', False):
@@ -358,9 +359,10 @@ class LighterSigningServiceGUI(ctk.CTk):
             try:
                 self.log("Starting service...", "INFO")
 
-                # Import and run uvicorn directly
+                # Import uvicorn and the service app
                 import sys
                 import importlib.util
+                import uvicorn
 
                 # Add service directory to path
                 service_path = str(self.service_dir)
@@ -382,23 +384,50 @@ class LighterSigningServiceGUI(ctk.CTk):
                 service_module = importlib.util.module_from_spec(spec)
                 sys.modules["service_main"] = service_module
 
+                # Execute the service module to get the FastAPI app
+                try:
+                    spec.loader.exec_module(service_module)
+                except Exception as exec_error:
+                    self.log(f"Service module load error: {str(exec_error)}", "ERROR")
+                    import traceback
+                    self.log(traceback.format_exc(), "ERROR")
+                    return
+
+                # Get the FastAPI app from the module
+                if not hasattr(service_module, 'app'):
+                    self.log("Service module does not have 'app' attribute", "ERROR")
+                    return
+
+                app = service_module.app
+
                 self.service_running = True
                 self.update_ui_state()
                 self.log(f"Service starting on port {self.service_port}...", "INFO")
 
-                # Execute the service module (this will start uvicorn)
+                # Start uvicorn server
                 try:
-                    spec.loader.exec_module(service_module)
+                    config = uvicorn.Config(
+                        app=app,
+                        host="0.0.0.0",
+                        port=self.service_port,
+                        log_level="info"
+                    )
+                    self.uvicorn_server = uvicorn.Server(config)
+
                     self.log(f"Service started on port {self.service_port}", "SUCCESS")
-                except Exception as exec_error:
-                    self.log(f"Service execution error: {str(exec_error)}", "ERROR")
+
+                    # Run the server (this blocks until stopped)
+                    import asyncio
+                    asyncio.run(self.uvicorn_server.serve())
+
+                except Exception as server_error:
+                    self.log(f"Server error: {str(server_error)}", "ERROR")
+                    import traceback
+                    self.log(traceback.format_exc(), "ERROR")
+                finally:
                     self.service_running = False
                     self.update_ui_state()
-                    return
-
-                # Keep the service running
-                while self.service_running:
-                    time.sleep(0.1)
+                    self.log("Service stopped", "INFO")
 
             except Exception as e:
                 self.log(f"Failed to start service: {str(e)}", "ERROR")
@@ -418,8 +447,14 @@ class LighterSigningServiceGUI(ctk.CTk):
 
         try:
             self.log("Stopping service...", "INFO")
+
+            # Signal the server to stop
+            if self.uvicorn_server:
+                self.uvicorn_server.should_exit = True
+
             self.service_running = False
             self.service_process = None
+            self.uvicorn_server = None
             self.update_ui_state()
             self.log("Service stopped successfully", "SUCCESS")
 
