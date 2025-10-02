@@ -10,12 +10,39 @@ import sys
 import subprocess
 import threading
 import time
+import logging
+import io
 from pathlib import Path
 from typing import Optional
 
 # Set appearance mode and color theme
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
+
+
+class GUILogHandler(logging.Handler):
+    """Custom logging handler that sends logs to the GUI"""
+    def __init__(self, gui_log_callback):
+        super().__init__()
+        self.gui_log_callback = gui_log_callback
+
+    def emit(self, record):
+        try:
+            msg = self.format(record)
+            # Determine log level
+            if record.levelno >= logging.ERROR:
+                level = "ERROR"
+            elif record.levelno >= logging.WARNING:
+                level = "WARNING"
+            elif record.levelno >= logging.INFO:
+                level = "SERVICE"
+            else:
+                level = "SERVICE"
+
+            # Send to GUI (thread-safe)
+            self.gui_log_callback(msg, level)
+        except Exception:
+            self.handleError(record)
 
 
 class LighterSigningServiceGUI(ctk.CTk):
@@ -295,7 +322,12 @@ class LighterSigningServiceGUI(ctk.CTk):
         self.footer_label.pack(pady=12)
 
     def log(self, message: str, level: str = "INFO"):
-        """Add a message to the log with color coding"""
+        """Add a message to the log with color coding (thread-safe)"""
+        # If called from a different thread, schedule on main thread
+        if threading.current_thread() != threading.main_thread():
+            self.after(0, lambda: self.log(message, level))
+            return
+
         timestamp = time.strftime("%H:%M:%S")
 
         # Define colors for different log levels (light mode, dark mode)
@@ -404,13 +436,30 @@ class LighterSigningServiceGUI(ctk.CTk):
                 self.update_ui_state()
                 self.log(f"Service starting on port {self.service_port}...", "INFO")
 
+                # Setup logging to capture uvicorn logs
+                # Create a custom log handler that sends to GUI
+                gui_handler = GUILogHandler(self.log)
+                gui_handler.setLevel(logging.INFO)
+                formatter = logging.Formatter('%(message)s')
+                gui_handler.setFormatter(formatter)
+
+                # Configure uvicorn loggers
+                uvicorn_logger = logging.getLogger("uvicorn")
+                uvicorn_logger.addHandler(gui_handler)
+                uvicorn_logger.setLevel(logging.INFO)
+
+                uvicorn_access_logger = logging.getLogger("uvicorn.access")
+                uvicorn_access_logger.addHandler(gui_handler)
+                uvicorn_access_logger.setLevel(logging.INFO)
+
                 # Start uvicorn server
                 try:
                     config = uvicorn.Config(
                         app=app,
                         host="0.0.0.0",
                         port=self.service_port,
-                        log_level="info"
+                        log_level="info",
+                        access_log=True
                     )
                     self.uvicorn_server = uvicorn.Server(config)
 
