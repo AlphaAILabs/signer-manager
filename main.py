@@ -14,6 +14,7 @@ import logging
 import io
 from pathlib import Path
 from typing import Optional
+from PIL import Image
 
 # Set appearance mode and color theme
 ctk.set_appearance_mode("dark")
@@ -92,6 +93,23 @@ class LighterSigningServiceGUI(ctk.CTk):
         self.geometry("900x700")
         self.minsize(800, 600)
 
+        # Set window icon
+        try:
+            if getattr(sys, 'frozen', False):
+                # Running as compiled executable
+                if hasattr(sys, '_MEIPASS'):
+                    icon_path = Path(sys._MEIPASS) / "logo.png"
+                else:
+                    icon_path = Path(sys.executable).parent / "logo.png"
+            else:
+                # Running as script
+                icon_path = Path(__file__).parent / "logo.png"
+
+            if icon_path.exists():
+                self.iconphoto(True, ctk.CTkImage(Image.open(icon_path), size=(32, 32))._light_image)
+        except Exception as e:
+            print(f"Could not load icon: {e}")
+
         # Service state
         self.service_process: Optional[subprocess.Popen] = None
         self.service_running = False
@@ -132,9 +150,30 @@ class LighterSigningServiceGUI(ctk.CTk):
         self.header_frame.grid_columnconfigure(0, weight=1)
         self.header_frame.grid_columnconfigure(1, weight=0)
 
-        # Title with gradient effect
+        # Logo and Title
         title_frame = ctk.CTkFrame(self.header_frame, fg_color="transparent")
         title_frame.grid(row=0, column=0, padx=20, pady=20, sticky="w")
+
+        # Load and display logo
+        try:
+            if getattr(sys, 'frozen', False):
+                if hasattr(sys, '_MEIPASS'):
+                    logo_path = Path(sys._MEIPASS) / "logo.png"
+                else:
+                    logo_path = Path(sys.executable).parent / "logo.png"
+            else:
+                logo_path = Path(__file__).parent / "logo.png"
+
+            if logo_path.exists():
+                logo_image = ctk.CTkImage(
+                    light_image=Image.open(logo_path),
+                    dark_image=Image.open(logo_path),
+                    size=(48, 48)
+                )
+                logo_label = ctk.CTkLabel(title_frame, image=logo_image, text="")
+                logo_label.pack(side="left", padx=(0, 15))
+        except Exception as e:
+            print(f"Could not load logo: {e}")
 
         self.title_label = ctk.CTkLabel(
             title_frame,

@@ -47,6 +47,7 @@ service_datas = [
     ('service/requirements.txt', 'service'),
     ('service/README.md', 'service'),
     ('service/signers/README.md', 'service/signers'),
+    ('logo.png', '.'),  # Include logo in root
 ]
 
 # Add platform-specific signer files only if they exist
@@ -196,7 +197,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=None,
+    icon='logo.png' if sys.platform != 'win32' else 'logo.png',  # PyInstaller will convert PNG
 )
 
 # For macOS, create an app bundle
@@ -204,7 +205,7 @@ if sys.platform == 'darwin':
     app = BUNDLE(
         exe,
         name='LighterSigningService.app',
-        icon=None,
+        icon='logo.png',
         bundle_identifier='com.alphalabs.lightersigningservice',
         info_plist={
             'CFBundleName': 'Lighter Signing Service',
