@@ -47,14 +47,31 @@ class GUILogHandler(logging.Handler):
 
 class StreamToLogger:
     """Redirect stdout/stderr to logger"""
-    def __init__(self, log_callback, level="SERVICE"):
+    def __init__(self, log_callback, default_level="SERVICE"):
         self.log_callback = log_callback
-        self.level = level
+        self.default_level = default_level
         self.buffer = ""
 
     def write(self, message):
         if message and message.strip():
-            self.log_callback(message.strip(), self.level)
+            msg = message.strip()
+
+            # Determine level based on message content
+            level = self.default_level
+            if "ERROR" in msg or "CRITICAL" in msg or "Exception" in msg or "Traceback" in msg:
+                level = "ERROR"
+            elif "WARNING" in msg or "WARN" in msg:
+                level = "WARNING"
+            elif "INFO:" in msg or "DEBUG:" in msg:
+                # Remove the INFO: or DEBUG: prefix for cleaner display
+                msg = msg.replace("INFO:", "").replace("DEBUG:", "").strip()
+                level = "SERVICE"
+            elif "Started server" in msg or "Uvicorn running" in msg or "Application startup" in msg:
+                level = "SERVICE"
+            elif "Shutting down" in msg or "shutdown" in msg.lower():
+                level = "SERVICE"
+
+            self.log_callback(msg, level)
 
     def flush(self):
         pass
@@ -463,7 +480,7 @@ class LighterSigningServiceGUI(ctk.CTk):
                     old_stdout = sys.stdout
                     old_stderr = sys.stderr
                     sys.stdout = StreamToLogger(self.log, "SERVICE")
-                    sys.stderr = StreamToLogger(self.log, "ERROR")
+                    sys.stderr = StreamToLogger(self.log, "SERVICE")  # uvicorn logs to stderr
 
                     try:
                         config = uvicorn.Config(
