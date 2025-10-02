@@ -59,6 +59,12 @@ class StreamToLogger:
     def flush(self):
         pass
 
+    def isatty(self):
+        return False
+
+    def fileno(self):
+        return -1
+
 
 class LighterSigningServiceGUI(ctk.CTk):
     def __init__(self):
