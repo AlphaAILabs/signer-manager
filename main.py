@@ -45,6 +45,21 @@ class GUILogHandler(logging.Handler):
             self.handleError(record)
 
 
+class StreamToLogger:
+    """Redirect stdout/stderr to logger"""
+    def __init__(self, log_callback, level="SERVICE"):
+        self.log_callback = log_callback
+        self.level = level
+        self.buffer = ""
+
+    def write(self, message):
+        if message and message.strip():
+            self.log_callback(message.strip(), self.level)
+
+    def flush(self):
+        pass
+
+
 class LighterSigningServiceGUI(ctk.CTk):
     def __init__(self):
         super().__init__()
@@ -436,38 +451,33 @@ class LighterSigningServiceGUI(ctk.CTk):
                 self.update_ui_state()
                 self.log(f"Service starting on port {self.service_port}...", "INFO")
 
-                # Setup logging to capture uvicorn logs
-                # Create a custom log handler that sends to GUI
-                gui_handler = GUILogHandler(self.log)
-                gui_handler.setLevel(logging.INFO)
-                formatter = logging.Formatter('%(message)s')
-                gui_handler.setFormatter(formatter)
-
-                # Configure uvicorn loggers
-                uvicorn_logger = logging.getLogger("uvicorn")
-                uvicorn_logger.addHandler(gui_handler)
-                uvicorn_logger.setLevel(logging.INFO)
-
-                uvicorn_access_logger = logging.getLogger("uvicorn.access")
-                uvicorn_access_logger.addHandler(gui_handler)
-                uvicorn_access_logger.setLevel(logging.INFO)
-
                 # Start uvicorn server
                 try:
-                    config = uvicorn.Config(
-                        app=app,
-                        host="0.0.0.0",
-                        port=self.service_port,
-                        log_level="info",
-                        access_log=True
-                    )
-                    self.uvicorn_server = uvicorn.Server(config)
+                    # Redirect stdout/stderr to capture all output
+                    old_stdout = sys.stdout
+                    old_stderr = sys.stderr
+                    sys.stdout = StreamToLogger(self.log, "SERVICE")
+                    sys.stderr = StreamToLogger(self.log, "ERROR")
 
-                    self.log(f"Service started on port {self.service_port}", "SUCCESS")
+                    try:
+                        config = uvicorn.Config(
+                            app=app,
+                            host="0.0.0.0",
+                            port=self.service_port,
+                            log_level="info",
+                            access_log=True
+                        )
+                        self.uvicorn_server = uvicorn.Server(config)
 
-                    # Run the server (this blocks until stopped)
-                    import asyncio
-                    asyncio.run(self.uvicorn_server.serve())
+                        self.log(f"Service started on port {self.service_port}", "SUCCESS")
+
+                        # Run the server (this blocks until stopped)
+                        import asyncio
+                        asyncio.run(self.uvicorn_server.serve())
+                    finally:
+                        # Restore stdout/stderr
+                        sys.stdout = old_stdout
+                        sys.stderr = old_stderr
 
                 except Exception as server_error:
                     self.log(f"Server error: {str(server_error)}", "ERROR")
