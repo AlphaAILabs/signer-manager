@@ -7,12 +7,14 @@ import platform
 import os
 import json
 import logging
+import asyncio
+from collections import defaultdict
 from eth_account import Account
 from eth_account.messages import encode_defunct
 
 logging.basicConfig(level=logging.DEBUG)
 
-app = FastAPI(title="Lighter Signing Service", version="1.0.0")
+app = FastAPI(title="Lighter Signing Service (Thread-Safe with Global Lock)", version="3.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -34,7 +36,6 @@ class StrOrErr(ctypes.Structure):
 def _initialize_signer():
     is_linux = platform.system() == "Linux"
     is_mac = platform.system() == "Darwin"
-    is_windows = platform.system() == "Windows"
     is_x64 = platform.machine().lower() in ("amd64", "x86_64")
     is_arm = platform.machine().lower() == "arm64"
 
@@ -47,15 +48,9 @@ def _initialize_signer():
     elif is_linux and is_x64:
         logging.debug("Detected x64/amd architecture on Linux.")
         return ctypes.CDLL(os.path.join(path_to_signer_folders, "signer-amd64.so"))
-    elif is_windows and is_x64:
-        logging.debug("Detected x64/amd architecture on Windows.")
-        dll_path = os.path.join(path_to_signer_folders, "signer-amd64.dll")
-        if not os.path.exists(dll_path):
-            raise Exception(f"Windows DLL not found: {dll_path}. Please check GitHub Actions build.")
-        return ctypes.CDLL(dll_path)
     else:
         raise Exception(
-            f"Unsupported platform/architecture: {platform.system()}/{platform.machine()}"
+            f"Unsupported platform/architecture: {platform.system()}/{platform.machine()} only supports Linux(x86) and Darwin(arm64)"
         )
 
 
@@ -68,6 +63,15 @@ except Exception as e:
 # Store client configurations and private keys
 clients = {}
 api_key_dict = {}  # Store api_key_index -> private_key mapping
+
+# Global lock to ensure thread safety
+# CRITICAL: The underlying Go library (sharedlib.go) uses unprotected global state:
+#   - var txClient *Client (current active client)
+#   - var backupTxClients map[uint8]*Client (client storage)
+# SwitchAPIKey() modifies txClient without synchronization, creating race conditions.
+# This global lock ensures that switch + sign operations are atomic across ALL accounts.
+# Trade-off: Sacrifices concurrency for correctness - all signing operations are serialized.
+global_signer_lock = asyncio.Lock()
 
 
 class CreateClientRequest(BaseModel):
@@ -97,10 +101,10 @@ class SignCreateOrderRequest(BaseModel):
     client_order_index: int
     base_amount: int
     price: int
-    is_ask: int  # Changed from bool to int to match what clients send
+    is_ask: int
     order_type: int
     time_in_force: int
-    reduce_only: int = 0  # Changed from bool to int to match what clients send
+    reduce_only: int = 0
     trigger_price: int = 0
     order_expiry: int = -1
     nonce: int = -1
@@ -220,8 +224,26 @@ def get_client_key(api_key_index: int, account_index: int) -> str:
     return f"{api_key_index}:{account_index}"
 
 
+async def _switch_api_key_internal(api_key_index: int):
+    """Internal function to switch API key - must be called within a lock"""
+    if not signer:
+        raise HTTPException(status_code=500, detail="Signer not initialized")
+
+    signer.SwitchAPIKey.argtypes = [ctypes.c_int]
+    signer.SwitchAPIKey.restype = ctypes.c_char_p
+
+    result = signer.SwitchAPIKey(api_key_index)
+    if result:
+        error_msg = result.decode("utf-8")
+        raise HTTPException(status_code=400, detail=f"Failed to switch API key: {error_msg}")
+
+
 @app.post("/create_client")
 async def create_client(request: CreateClientRequest):
+    """
+    Create a new client. This operation is thread-safe.
+    Uses global lock to prevent race conditions in the underlying Go library.
+    """
     try:
         if not signer:
             raise HTTPException(status_code=500, detail="Signer not initialized")
@@ -234,37 +256,39 @@ async def create_client(request: CreateClientRequest):
         if private_key.startswith("0x"):
             private_key = private_key[2:]
 
-        # Store the private key for this api_key_index
-        api_key_dict[request.api_key_index] = private_key
+        # Acquire global lock to ensure thread-safe client creation
+        async with global_signer_lock:
+            # Store the private key for this api_key_index
+            api_key_dict[request.api_key_index] = private_key
 
-        signer.CreateClient.argtypes = [
-            ctypes.c_char_p,
-            ctypes.c_char_p,
-            ctypes.c_int,
-            ctypes.c_int,
-            ctypes.c_longlong,
-        ]
-        signer.CreateClient.restype = ctypes.c_char_p
+            signer.CreateClient.argtypes = [
+                ctypes.c_char_p,
+                ctypes.c_char_p,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_longlong,
+            ]
+            signer.CreateClient.restype = ctypes.c_char_p
 
-        err = signer.CreateClient(
-            request.url.encode("utf-8"),
-            private_key.encode("utf-8"),
-            chain_id,
-            request.api_key_index,
-            request.account_index,
-        )
+            err = signer.CreateClient(
+                request.url.encode("utf-8"),
+                private_key.encode("utf-8"),
+                chain_id,
+                request.api_key_index,
+                request.account_index,
+            )
 
-        if err:
-            err_str = err.decode("utf-8")
-            raise HTTPException(status_code=400, detail=err_str)
+            if err:
+                err_str = err.decode("utf-8")
+                raise HTTPException(status_code=400, detail=err_str)
 
-        client_key = get_client_key(request.api_key_index, request.account_index)
-        clients[client_key] = {
-            "url": request.url,
-            "chain_id": chain_id,
-            "api_key_index": request.api_key_index,
-            "account_index": request.account_index
-        }
+            client_key = get_client_key(request.api_key_index, request.account_index)
+            clients[client_key] = {
+                "url": request.url,
+                "chain_id": chain_id,
+                "api_key_index": request.api_key_index,
+                "account_index": request.account_index
+            }
 
         return {"message": "Client created successfully", "client_key": client_key}
     except HTTPException:
@@ -276,34 +300,35 @@ async def create_client(request: CreateClientRequest):
 
 @app.post("/check_client")
 async def check_client(request: CheckClientRequest):
+    """
+    Check if a client exists and is valid. Thread-safe read operation.
+    """
     try:
-        signer.CheckClient.argtypes = [
-            ctypes.c_int,
-            ctypes.c_longlong,
-        ]
-        signer.CheckClient.restype = ctypes.c_char_p
+        # Acquire global lock
+        async with global_signer_lock:
+            signer.CheckClient.argtypes = [
+                ctypes.c_int,
+                ctypes.c_longlong,
+            ]
+            signer.CheckClient.restype = ctypes.c_char_p
 
-        result = signer.CheckClient(request.api_key_index, request.account_index)
-        if result:
-            return {"error": result.decode("utf-8")}
-        return {"message": "Client is valid"}
+            result = signer.CheckClient(request.api_key_index, request.account_index)
+            if result:
+                return {"error": result.decode("utf-8")}
+            return {"message": "Client is valid"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/switch_api_key")
 async def switch_api_key(request: SwitchApiKeyRequest):
+    """
+    Switch the active API key. Thread-safe with global locking.
+    """
     try:
-        if not signer:
-            raise HTTPException(status_code=500, detail="Signer not initialized")
-
-        signer.SwitchAPIKey.argtypes = [ctypes.c_int]
-        signer.SwitchAPIKey.restype = ctypes.c_char_p  # Fixed: was CheckClient.restype
-
-        result = signer.SwitchAPIKey(request.api_key_index)
-        if result:
-            return {"error": result.decode("utf-8")}
-        return {"message": "API key switched successfully"}
+        async with global_signer_lock:
+            await _switch_api_key_internal(request.api_key_index)
+            return {"message": "API key switched successfully"}
     except HTTPException:
         raise
     except Exception as e:
@@ -313,6 +338,10 @@ async def switch_api_key(request: SwitchApiKeyRequest):
 
 @app.post("/create_api_key")
 async def create_api_key(request: CreateApiKeyRequest):
+    """
+    Generate a new API key pair. This operation uses a temporary signer if needed.
+    Thread-safe as it doesn't modify global state.
+    """
     try:
         if not signer:
             # Create a temporary signer for this operation
@@ -345,29 +374,35 @@ async def create_api_key(request: CreateApiKeyRequest):
 
 @app.post("/sign_change_api_key")
 async def sign_change_api_key(request: SignChangeApiKeyRequest):
+    """
+    Sign a change API key transaction. Thread-safe with global locking.
+    The lock ensures that switch_api_key and signing happen atomically.
+    """
     try:
-        await switch_api_key(SwitchApiKeyRequest(api_key_index=request.api_key_index))
+        # Acquire global lock to ensure atomic switch + sign
+        async with global_signer_lock:
+            await _switch_api_key_internal(request.api_key_index)
 
-        signer.SignChangePubKey.argtypes = [
-            ctypes.c_char_p,
-            ctypes.c_longlong,
-        ]
-        signer.SignChangePubKey.restype = StrOrErr
-        result = signer.SignChangePubKey(ctypes.c_char_p(request.new_pubkey.encode("utf-8")), request.nonce)
+            signer.SignChangePubKey.argtypes = [
+                ctypes.c_char_p,
+                ctypes.c_longlong,
+            ]
+            signer.SignChangePubKey.restype = StrOrErr
+            result = signer.SignChangePubKey(ctypes.c_char_p(request.new_pubkey.encode("utf-8")), request.nonce)
 
-        tx_info_str = result.str.decode("utf-8") if result.str else None
-        error = result.err.decode("utf-8") if result.err else None
-        if error:
-            raise HTTPException(status_code=400, detail=error)
+            tx_info_str = result.str.decode("utf-8") if result.str else None
+            error = result.err.decode("utf-8") if result.err else None
+            if error:
+                raise HTTPException(status_code=400, detail=error)
 
-        tx_info = json.loads(tx_info_str)
-        msg_to_sign = tx_info["MessageToSign"]
-        del tx_info["MessageToSign"]
+            tx_info = json.loads(tx_info_str)
+            msg_to_sign = tx_info["MessageToSign"]
+            del tx_info["MessageToSign"]
 
-        acct = Account.from_key(request.eth_private_key)
-        message = encode_defunct(text=msg_to_sign)
-        signature = acct.sign_message(message)
-        tx_info["L1Sig"] = signature.signature.to_0x_hex()
+            acct = Account.from_key(request.eth_private_key)
+            message = encode_defunct(text=msg_to_sign)
+            signature = acct.sign_message(message)
+            tx_info["L1Sig"] = signature.signature.to_0x_hex()
 
         return {"tx_info": json.dumps(tx_info)}
     except Exception as e:
@@ -376,55 +411,60 @@ async def sign_change_api_key(request: SignChangeApiKeyRequest):
 
 @app.post("/sign_create_order")
 async def sign_create_order(request: SignCreateOrderRequest):
+    """
+    Sign a create order transaction. Thread-safe with global locking.
+    All signing operations are serialized to prevent race conditions.
+    """
     try:
         if not signer:
             raise HTTPException(status_code=500, detail="Signer not initialized")
 
-        logging.debug(f"sign_create_order request: market_index={request.market_index}, "
+        logging.debug(f"sign_create_order request: api_key_index={request.api_key_index}, "
+                     f"market_index={request.market_index}, "
                      f"client_order_index={request.client_order_index}, base_amount={request.base_amount}, "
-                     f"price={request.price}, is_ask={request.is_ask} (type={type(request.is_ask)}), "
+                     f"price={request.price}, is_ask={request.is_ask}, "
                      f"order_type={request.order_type}, time_in_force={request.time_in_force}, "
-                     f"reduce_only={request.reduce_only} (type={type(request.reduce_only)}), "
+                     f"reduce_only={request.reduce_only}, "
                      f"trigger_price={request.trigger_price}, order_expiry={request.order_expiry}, nonce={request.nonce}")
 
-        await switch_api_key(SwitchApiKeyRequest(api_key_index=request.api_key_index))
+        # Acquire global lock to ensure atomic switch + sign
+        async with global_signer_lock:
+            await _switch_api_key_internal(request.api_key_index)
 
-        signer.SignCreateOrder.argtypes = [
-            ctypes.c_int,
-            ctypes.c_longlong,
-            ctypes.c_longlong,
-            ctypes.c_int,
-            ctypes.c_int,
-            ctypes.c_int,
-            ctypes.c_int,
-            ctypes.c_int,
-            ctypes.c_int,
-            ctypes.c_longlong,
-            ctypes.c_longlong,
-        ]
-        signer.SignCreateOrder.restype = StrOrErr
+            signer.SignCreateOrder.argtypes = [
+                ctypes.c_int,
+                ctypes.c_longlong,
+                ctypes.c_longlong,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_longlong,
+                ctypes.c_longlong,
+            ]
+            signer.SignCreateOrder.restype = StrOrErr
 
-        # Exact same order as original: line 338-350 of signer_client.py
-        # Note: is_ask and reduce_only are already int (converted by clients before sending)
-        result = signer.SignCreateOrder(
-            request.market_index,
-            request.client_order_index,
-            request.base_amount,
-            request.price,
-            request.is_ask,
-            request.order_type,
-            request.time_in_force,
-            request.reduce_only,
-            request.trigger_price,
-            request.order_expiry,
-            request.nonce,
-        )
+            result = signer.SignCreateOrder(
+                request.market_index,
+                request.client_order_index,
+                request.base_amount,
+                request.price,
+                request.is_ask,
+                request.order_type,
+                request.time_in_force,
+                request.reduce_only,
+                request.trigger_price,
+                request.order_expiry,
+                request.nonce,
+            )
 
-        tx_info = result.str.decode("utf-8") if result.str else None
-        error = result.err.decode("utf-8") if result.err else None
+            tx_info = result.str.decode("utf-8") if result.str else None
+            error = result.err.decode("utf-8") if result.err else None
 
-        if error:
-            raise HTTPException(status_code=400, detail=error)
+            if error:
+                raise HTTPException(status_code=400, detail=error)
 
         return {"tx_info": tx_info}
     except HTTPException:
@@ -436,26 +476,31 @@ async def sign_create_order(request: SignCreateOrderRequest):
 
 @app.post("/sign_cancel_order")
 async def sign_cancel_order(request: SignCancelOrderRequest):
+    """
+    Sign a cancel order transaction. Thread-safe with global locking.
+    """
     try:
         if not signer:
             raise HTTPException(status_code=500, detail="Signer not initialized")
 
-        await switch_api_key(SwitchApiKeyRequest(api_key_index=request.api_key_index))
+        # Acquire global lock to ensure atomic switch + sign
+        async with global_signer_lock:
+            await _switch_api_key_internal(request.api_key_index)
 
-        signer.SignCancelOrder.argtypes = [
-            ctypes.c_int,
-            ctypes.c_longlong,
-            ctypes.c_longlong,
-        ]
-        signer.SignCancelOrder.restype = StrOrErr
+            signer.SignCancelOrder.argtypes = [
+                ctypes.c_int,
+                ctypes.c_longlong,
+                ctypes.c_longlong,
+            ]
+            signer.SignCancelOrder.restype = StrOrErr
 
-        result = signer.SignCancelOrder(request.market_index, request.order_index, request.nonce)
+            result = signer.SignCancelOrder(request.market_index, request.order_index, request.nonce)
 
-        tx_info = result.str.decode("utf-8") if result.str else None
-        error = result.err.decode("utf-8") if result.err else None
+            tx_info = result.str.decode("utf-8") if result.str else None
+            error = result.err.decode("utf-8") if result.err else None
 
-        if error:
-            raise HTTPException(status_code=400, detail=error)
+            if error:
+                raise HTTPException(status_code=400, detail=error)
 
         return {"tx_info": tx_info}
     except HTTPException:
@@ -467,19 +512,24 @@ async def sign_cancel_order(request: SignCancelOrderRequest):
 
 @app.post("/sign_withdraw")
 async def sign_withdraw(request: SignWithdrawRequest):
+    """
+    Sign a withdraw transaction. Thread-safe with global locking.
+    """
     try:
-        await switch_api_key(SwitchApiKeyRequest(api_key_index=request.api_key_index))
+        # Acquire global lock to ensure atomic switch + sign
+        async with global_signer_lock:
+            await _switch_api_key_internal(request.api_key_index)
 
-        signer.SignWithdraw.argtypes = [ctypes.c_longlong, ctypes.c_longlong]
-        signer.SignWithdraw.restype = StrOrErr
+            signer.SignWithdraw.argtypes = [ctypes.c_longlong, ctypes.c_longlong]
+            signer.SignWithdraw.restype = StrOrErr
 
-        result = signer.SignWithdraw(request.usdc_amount, request.nonce)
+            result = signer.SignWithdraw(request.usdc_amount, request.nonce)
 
-        tx_info = result.str.decode("utf-8") if result.str else None
-        error = result.err.decode("utf-8") if result.err else None
+            tx_info = result.str.decode("utf-8") if result.str else None
+            error = result.err.decode("utf-8") if result.err else None
 
-        if error:
-            raise HTTPException(status_code=400, detail=error)
+            if error:
+                raise HTTPException(status_code=400, detail=error)
 
         return {"tx_info": tx_info}
     except Exception as e:
@@ -488,19 +538,24 @@ async def sign_withdraw(request: SignWithdrawRequest):
 
 @app.post("/sign_create_sub_account")
 async def sign_create_sub_account(request: SignCreateSubAccountRequest):
+    """
+    Sign a create sub-account transaction. Thread-safe with global locking.
+    """
     try:
-        await switch_api_key(SwitchApiKeyRequest(api_key_index=request.api_key_index))
+        # Acquire global lock to ensure atomic switch + sign
+        async with global_signer_lock:
+            await _switch_api_key_internal(request.api_key_index)
 
-        signer.SignCreateSubAccount.argtypes = [ctypes.c_longlong]
-        signer.SignCreateSubAccount.restype = StrOrErr
+            signer.SignCreateSubAccount.argtypes = [ctypes.c_longlong]
+            signer.SignCreateSubAccount.restype = StrOrErr
 
-        result = signer.SignCreateSubAccount(request.nonce)
+            result = signer.SignCreateSubAccount(request.nonce)
 
-        tx_info = result.str.decode("utf-8") if result.str else None
-        error = result.err.decode("utf-8") if result.err else None
+            tx_info = result.str.decode("utf-8") if result.str else None
+            error = result.err.decode("utf-8") if result.err else None
 
-        if error:
-            raise HTTPException(status_code=400, detail=error)
+            if error:
+                raise HTTPException(status_code=400, detail=error)
 
         return {"tx_info": tx_info}
     except Exception as e:
@@ -509,23 +564,28 @@ async def sign_create_sub_account(request: SignCreateSubAccountRequest):
 
 @app.post("/sign_cancel_all_orders")
 async def sign_cancel_all_orders(request: SignCancelAllOrdersRequest):
+    """
+    Sign a cancel all orders transaction. Thread-safe with global locking.
+    """
     try:
-        await switch_api_key(SwitchApiKeyRequest(api_key_index=request.api_key_index))
+        # Acquire global lock to ensure atomic switch + sign
+        async with global_signer_lock:
+            await _switch_api_key_internal(request.api_key_index)
 
-        signer.SignCancelAllOrders.argtypes = [
-            ctypes.c_int,
-            ctypes.c_longlong,
-            ctypes.c_longlong,
-        ]
-        signer.SignCancelAllOrders.restype = StrOrErr
+            signer.SignCancelAllOrders.argtypes = [
+                ctypes.c_int,
+                ctypes.c_longlong,
+                ctypes.c_longlong,
+            ]
+            signer.SignCancelAllOrders.restype = StrOrErr
 
-        result = signer.SignCancelAllOrders(request.time_in_force, request.time, request.nonce)
+            result = signer.SignCancelAllOrders(request.time_in_force, request.time, request.nonce)
 
-        tx_info = result.str.decode("utf-8") if result.str else None
-        error = result.err.decode("utf-8") if result.err else None
+            tx_info = result.str.decode("utf-8") if result.str else None
+            error = result.err.decode("utf-8") if result.err else None
 
-        if error:
-            raise HTTPException(status_code=400, detail=error)
+            if error:
+                raise HTTPException(status_code=400, detail=error)
 
         return {"tx_info": tx_info}
     except Exception as e:
@@ -534,33 +594,38 @@ async def sign_cancel_all_orders(request: SignCancelAllOrdersRequest):
 
 @app.post("/sign_modify_order")
 async def sign_modify_order(request: SignModifyOrderRequest):
+    """
+    Sign a modify order transaction. Thread-safe with global locking.
+    """
     try:
-        await switch_api_key(SwitchApiKeyRequest(api_key_index=request.api_key_index))
+        # Acquire global lock to ensure atomic switch + sign
+        async with global_signer_lock:
+            await _switch_api_key_internal(request.api_key_index)
 
-        signer.SignModifyOrder.argtypes = [
-            ctypes.c_int,
-            ctypes.c_longlong,
-            ctypes.c_longlong,
-            ctypes.c_longlong,
-            ctypes.c_longlong,
-            ctypes.c_longlong,
-        ]
-        signer.SignModifyOrder.restype = StrOrErr
+            signer.SignModifyOrder.argtypes = [
+                ctypes.c_int,
+                ctypes.c_longlong,
+                ctypes.c_longlong,
+                ctypes.c_longlong,
+                ctypes.c_longlong,
+                ctypes.c_longlong,
+            ]
+            signer.SignModifyOrder.restype = StrOrErr
 
-        result = signer.SignModifyOrder(
-            request.market_index,
-            request.order_index,
-            request.base_amount,
-            request.price,
-            request.trigger_price,
-            request.nonce
-        )
+            result = signer.SignModifyOrder(
+                request.market_index,
+                request.order_index,
+                request.base_amount,
+                request.price,
+                request.trigger_price,
+                request.nonce
+            )
 
-        tx_info = result.str.decode("utf-8") if result.str else None
-        error = result.err.decode("utf-8") if result.err else None
+            tx_info = result.str.decode("utf-8") if result.str else None
+            error = result.err.decode("utf-8") if result.err else None
 
-        if error:
-            raise HTTPException(status_code=400, detail=error)
+            if error:
+                raise HTTPException(status_code=400, detail=error)
 
         return {"tx_info": tx_info}
     except Exception as e:
@@ -569,40 +634,45 @@ async def sign_modify_order(request: SignModifyOrderRequest):
 
 @app.post("/sign_transfer")
 async def sign_transfer(request: SignTransferRequest):
+    """
+    Sign a transfer transaction. Thread-safe with global locking.
+    """
     try:
-        await switch_api_key(SwitchApiKeyRequest(api_key_index=request.api_key_index))
+        # Acquire global lock to ensure atomic switch + sign
+        async with global_signer_lock:
+            await _switch_api_key_internal(request.api_key_index)
 
-        signer.SignTransfer.argtypes = [
-            ctypes.c_longlong,
-            ctypes.c_longlong,
-            ctypes.c_longlong,
-            ctypes.c_char_p,
-            ctypes.c_longlong,
-        ]
-        signer.SignTransfer.restype = StrOrErr
+            signer.SignTransfer.argtypes = [
+                ctypes.c_longlong,
+                ctypes.c_longlong,
+                ctypes.c_longlong,
+                ctypes.c_char_p,
+                ctypes.c_longlong,
+            ]
+            signer.SignTransfer.restype = StrOrErr
 
-        result = signer.SignTransfer(
-            request.to_account_index,
-            request.usdc_amount,
-            request.fee,
-            ctypes.c_char_p(request.memo.encode("utf-8")),
-            request.nonce
-        )
+            result = signer.SignTransfer(
+                request.to_account_index,
+                request.usdc_amount,
+                request.fee,
+                ctypes.c_char_p(request.memo.encode("utf-8")),
+                request.nonce
+            )
 
-        tx_info_str = result.str.decode("utf-8") if result.str else None
-        error = result.err.decode("utf-8") if result.err else None
+            tx_info_str = result.str.decode("utf-8") if result.str else None
+            error = result.err.decode("utf-8") if result.err else None
 
-        if error:
-            raise HTTPException(status_code=400, detail=error)
+            if error:
+                raise HTTPException(status_code=400, detail=error)
 
-        tx_info = json.loads(tx_info_str)
-        msg_to_sign = tx_info["MessageToSign"]
-        del tx_info["MessageToSign"]
+            tx_info = json.loads(tx_info_str)
+            msg_to_sign = tx_info["MessageToSign"]
+            del tx_info["MessageToSign"]
 
-        acct = Account.from_key(request.eth_private_key)
-        message = encode_defunct(text=msg_to_sign)
-        signature = acct.sign_message(message)
-        tx_info["L1Sig"] = signature.signature.to_0x_hex()
+            acct = Account.from_key(request.eth_private_key)
+            message = encode_defunct(text=msg_to_sign)
+            signature = acct.sign_message(message)
+            tx_info["L1Sig"] = signature.signature.to_0x_hex()
 
         return {"tx_info": json.dumps(tx_info)}
     except Exception as e:
@@ -611,29 +681,34 @@ async def sign_transfer(request: SignTransferRequest):
 
 @app.post("/sign_create_public_pool")
 async def sign_create_public_pool(request: SignCreatePublicPoolRequest):
+    """
+    Sign a create public pool transaction. Thread-safe with global locking.
+    """
     try:
-        await switch_api_key(SwitchApiKeyRequest(api_key_index=request.api_key_index))
+        # Acquire global lock to ensure atomic switch + sign
+        async with global_signer_lock:
+            await _switch_api_key_internal(request.api_key_index)
 
-        signer.SignCreatePublicPool.argtypes = [
-            ctypes.c_longlong,
-            ctypes.c_longlong,
-            ctypes.c_longlong,
-            ctypes.c_longlong,
-        ]
-        signer.SignCreatePublicPool.restype = StrOrErr
+            signer.SignCreatePublicPool.argtypes = [
+                ctypes.c_longlong,
+                ctypes.c_longlong,
+                ctypes.c_longlong,
+                ctypes.c_longlong,
+            ]
+            signer.SignCreatePublicPool.restype = StrOrErr
 
-        result = signer.SignCreatePublicPool(
-            request.operator_fee,
-            request.initial_total_shares,
-            request.min_operator_share_rate,
-            request.nonce
-        )
+            result = signer.SignCreatePublicPool(
+                request.operator_fee,
+                request.initial_total_shares,
+                request.min_operator_share_rate,
+                request.nonce
+            )
 
-        tx_info = result.str.decode("utf-8") if result.str else None
-        error = result.err.decode("utf-8") if result.err else None
+            tx_info = result.str.decode("utf-8") if result.str else None
+            error = result.err.decode("utf-8") if result.err else None
 
-        if error:
-            raise HTTPException(status_code=400, detail=error)
+            if error:
+                raise HTTPException(status_code=400, detail=error)
 
         return {"tx_info": tx_info}
     except Exception as e:
@@ -642,31 +717,36 @@ async def sign_create_public_pool(request: SignCreatePublicPoolRequest):
 
 @app.post("/sign_update_public_pool")
 async def sign_update_public_pool(request: SignUpdatePublicPoolRequest):
+    """
+    Sign an update public pool transaction. Thread-safe with global locking.
+    """
     try:
-        await switch_api_key(SwitchApiKeyRequest(api_key_index=request.api_key_index))
+        # Acquire global lock to ensure atomic switch + sign
+        async with global_signer_lock:
+            await _switch_api_key_internal(request.api_key_index)
 
-        signer.SignUpdatePublicPool.argtypes = [
-            ctypes.c_longlong,
-            ctypes.c_int,
-            ctypes.c_longlong,
-            ctypes.c_longlong,
-            ctypes.c_longlong,
-        ]
-        signer.SignUpdatePublicPool.restype = StrOrErr
+            signer.SignUpdatePublicPool.argtypes = [
+                ctypes.c_longlong,
+                ctypes.c_int,
+                ctypes.c_longlong,
+                ctypes.c_longlong,
+                ctypes.c_longlong,
+            ]
+            signer.SignUpdatePublicPool.restype = StrOrErr
 
-        result = signer.SignUpdatePublicPool(
-            request.public_pool_index,
-            request.status,
-            request.operator_fee,
-            request.min_operator_share_rate,
-            request.nonce
-        )
+            result = signer.SignUpdatePublicPool(
+                request.public_pool_index,
+                request.status,
+                request.operator_fee,
+                request.min_operator_share_rate,
+                request.nonce
+            )
 
-        tx_info = result.str.decode("utf-8") if result.str else None
-        error = result.err.decode("utf-8") if result.err else None
+            tx_info = result.str.decode("utf-8") if result.str else None
+            error = result.err.decode("utf-8") if result.err else None
 
-        if error:
-            raise HTTPException(status_code=400, detail=error)
+            if error:
+                raise HTTPException(status_code=400, detail=error)
 
         return {"tx_info": tx_info}
     except Exception as e:
@@ -675,27 +755,32 @@ async def sign_update_public_pool(request: SignUpdatePublicPoolRequest):
 
 @app.post("/sign_mint_shares")
 async def sign_mint_shares(request: SignMintSharesRequest):
+    """
+    Sign a mint shares transaction. Thread-safe with global locking.
+    """
     try:
-        await switch_api_key(SwitchApiKeyRequest(api_key_index=request.api_key_index))
+        # Acquire global lock to ensure atomic switch + sign
+        async with global_signer_lock:
+            await _switch_api_key_internal(request.api_key_index)
 
-        signer.SignMintShares.argtypes = [
-            ctypes.c_longlong,
-            ctypes.c_longlong,
-            ctypes.c_longlong,
-        ]
-        signer.SignMintShares.restype = StrOrErr
+            signer.SignMintShares.argtypes = [
+                ctypes.c_longlong,
+                ctypes.c_longlong,
+                ctypes.c_longlong,
+            ]
+            signer.SignMintShares.restype = StrOrErr
 
-        result = signer.SignMintShares(
-            request.public_pool_index,
-            request.share_amount,
-            request.nonce
-        )
+            result = signer.SignMintShares(
+                request.public_pool_index,
+                request.share_amount,
+                request.nonce
+            )
 
-        tx_info = result.str.decode("utf-8") if result.str else None
-        error = result.err.decode("utf-8") if result.err else None
+            tx_info = result.str.decode("utf-8") if result.str else None
+            error = result.err.decode("utf-8") if result.err else None
 
-        if error:
-            raise HTTPException(status_code=400, detail=error)
+            if error:
+                raise HTTPException(status_code=400, detail=error)
 
         return {"tx_info": tx_info}
     except Exception as e:
@@ -704,27 +789,32 @@ async def sign_mint_shares(request: SignMintSharesRequest):
 
 @app.post("/sign_burn_shares")
 async def sign_burn_shares(request: SignBurnSharesRequest):
+    """
+    Sign a burn shares transaction. Thread-safe with global locking.
+    """
     try:
-        await switch_api_key(SwitchApiKeyRequest(api_key_index=request.api_key_index))
+        # Acquire global lock to ensure atomic switch + sign
+        async with global_signer_lock:
+            await _switch_api_key_internal(request.api_key_index)
 
-        signer.SignBurnShares.argtypes = [
-            ctypes.c_longlong,
-            ctypes.c_longlong,
-            ctypes.c_longlong,
-        ]
-        signer.SignBurnShares.restype = StrOrErr
+            signer.SignBurnShares.argtypes = [
+                ctypes.c_longlong,
+                ctypes.c_longlong,
+                ctypes.c_longlong,
+            ]
+            signer.SignBurnShares.restype = StrOrErr
 
-        result = signer.SignBurnShares(
-            request.public_pool_index,
-            request.share_amount,
-            request.nonce
-        )
+            result = signer.SignBurnShares(
+                request.public_pool_index,
+                request.share_amount,
+                request.nonce
+            )
 
-        tx_info = result.str.decode("utf-8") if result.str else None
-        error = result.err.decode("utf-8") if result.err else None
+            tx_info = result.str.decode("utf-8") if result.str else None
+            error = result.err.decode("utf-8") if result.err else None
 
-        if error:
-            raise HTTPException(status_code=400, detail=error)
+            if error:
+                raise HTTPException(status_code=400, detail=error)
 
         return {"tx_info": tx_info}
     except Exception as e:
@@ -733,29 +823,34 @@ async def sign_burn_shares(request: SignBurnSharesRequest):
 
 @app.post("/sign_update_leverage")
 async def sign_update_leverage(request: SignUpdateLeverageRequest):
+    """
+    Sign an update leverage transaction. Thread-safe with global locking.
+    """
     try:
-        await switch_api_key(SwitchApiKeyRequest(api_key_index=request.api_key_index))
+        # Acquire global lock to ensure atomic switch + sign
+        async with global_signer_lock:
+            await _switch_api_key_internal(request.api_key_index)
 
-        signer.SignUpdateLeverage.argtypes = [
-            ctypes.c_int,
-            ctypes.c_int,
-            ctypes.c_int,
-            ctypes.c_longlong,
-        ]
-        signer.SignUpdateLeverage.restype = StrOrErr
+            signer.SignUpdateLeverage.argtypes = [
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_longlong,
+            ]
+            signer.SignUpdateLeverage.restype = StrOrErr
 
-        result = signer.SignUpdateLeverage(
-            request.market_index,
-            request.fraction,
-            request.margin_mode,
-            request.nonce
-        )
+            result = signer.SignUpdateLeverage(
+                request.market_index,
+                request.fraction,
+                request.margin_mode,
+                request.nonce
+            )
 
-        tx_info = result.str.decode("utf-8") if result.str else None
-        error = result.err.decode("utf-8") if result.err else None
+            tx_info = result.str.decode("utf-8") if result.str else None
+            error = result.err.decode("utf-8") if result.err else None
 
-        if error:
-            raise HTTPException(status_code=400, detail=error)
+            if error:
+                raise HTTPException(status_code=400, detail=error)
 
         return {"tx_info": tx_info}
     except Exception as e:
@@ -764,24 +859,27 @@ async def sign_update_leverage(request: SignUpdateLeverageRequest):
 
 @app.post("/create_auth_token")
 async def create_auth_token(request: CreateAuthTokenRequest):
+    """
+    Create an authentication token. Thread-safe with global locking.
+    """
     try:
         if not signer:
             raise HTTPException(status_code=500, detail="Signer not initialized")
 
-        # First switch to the correct API key
-        await switch_api_key(SwitchApiKeyRequest(api_key_index=request.api_key_index))
+        # Acquire global lock to ensure atomic switch + create
+        async with global_signer_lock:
+            await _switch_api_key_internal(request.api_key_index)
 
-        # Following exact implementation from line 535-544 of signer_client.py
-        signer.CreateAuthToken.argtypes = [ctypes.c_longlong]
-        signer.CreateAuthToken.restype = StrOrErr
+            signer.CreateAuthToken.argtypes = [ctypes.c_longlong]
+            signer.CreateAuthToken.restype = StrOrErr
 
-        result = signer.CreateAuthToken(request.deadline)
+            result = signer.CreateAuthToken(request.deadline)
 
-        auth = result.str.decode("utf-8") if result.str else None
-        error = result.err.decode("utf-8") if result.err else None
+            auth = result.str.decode("utf-8") if result.str else None
+            error = result.err.decode("utf-8") if result.err else None
 
-        if error:
-            raise HTTPException(status_code=400, detail=error)
+            if error:
+                raise HTTPException(status_code=400, detail=error)
 
         return {"auth_token": auth}
     except HTTPException:
@@ -793,9 +891,15 @@ async def create_auth_token(request: CreateAuthTokenRequest):
 
 @app.get("/health")
 async def health():
-    return {"status": "healthy"}
+    return {
+        "status": "healthy",
+        "version": "3.0.0",
+        "thread_safe": True,
+        "lock_type": "global",
+        "note": "All signing operations are serialized for safety"
+    }
 
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=10000)

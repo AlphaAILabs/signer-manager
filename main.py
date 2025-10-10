@@ -89,7 +89,7 @@ class LighterSigningServiceGUI(ctk.CTk):
         super().__init__()
 
         # Configure window
-        self.title("Lighter Signing Service Manager")
+        self.title("AlphaLabs Signer Manager")
         self.geometry("900x700")
         self.minsize(800, 600)
 
@@ -128,7 +128,7 @@ class LighterSigningServiceGUI(ctk.CTk):
             application_path = Path(__file__).parent
 
         self.service_dir = application_path / "service"
-        self.service_port = 8000
+        self.service_port = 10000
 
         # Theme state
         self.current_theme = "dark"
@@ -223,56 +223,44 @@ class LighterSigningServiceGUI(ctk.CTk):
         self.main_frame.grid_columnconfigure(0, weight=1)
         self.main_frame.grid_rowconfigure(2, weight=1)
 
-        # Service Card - Lighter EdgeX Style
-        self.service_card = ctk.CTkFrame(
-            self.main_frame,
-            corner_radius=15,
-            fg_color=("gray95", "gray15"),
-            border_width=1,
-            border_color=("gray80", "gray25")
-        )
-        self.service_card.grid(row=0, column=0, sticky="ew", padx=20, pady=(20, 10))
-        self.service_card.grid_columnconfigure(0, weight=1)
+        # Service Cards Container - Horizontal Layout
+        self.service_cards_frame = ctk.CTkFrame(self.main_frame, fg_color="transparent")
+        self.service_cards_frame.grid(row=0, column=0, sticky="ew", padx=20, pady=(20, 10))
+        # Configure 3 columns with equal weight
+        self.service_cards_frame.grid_columnconfigure((0, 1, 2), weight=1)
 
-        # Card header
-        card_header = ctk.CTkFrame(self.service_card, fg_color="transparent")
-        card_header.grid(row=0, column=0, sticky="ew", padx=25, pady=(20, 10))
-        card_header.grid_columnconfigure(1, weight=1)
+        # Strategy configurations - all with same badge color
+        strategies = [
+            {
+                "name": "Lighter-EdgeX [002]",
+                "desc": "结合两大核心插件优势，提供超低磨损率，是追求稳定高收益的最佳选择",
+                "wear_rate": "磨损率 0.023% - 0.025%",
+                "badge": "已上线",
+                "badge_color": ("#52C41A", "#52C41A")  # Green for all
+            },
+            {
+                "name": "Lighter-Based [003]",
+                "desc": "基于 Based 协议的策略，平衡收益与风险，支持大部分 token",
+                "wear_rate": "磨损率 0.02% - 0.023%",
+                "badge": "已上线",
+                "badge_color": ("#52C41A", "#52C41A")  # Green for all
+            },
+            {
+                "name": "Lighter-Backpack [005]",
+                "desc": "集成 Backpack 生态，灵活的磨损率范围适应不同市场环境，支持大部分 token",
+                "wear_rate": "磨损率 0.014% - 0.035%",
+                "badge": "已上线",
+                "badge_color": ("#52C41A", "#52C41A")  # Green for all
+            }
+        ]
 
-        service_title = ctk.CTkLabel(
-            card_header,
-            text="Lighter - EdgeX[002]",
-            font=ctk.CTkFont(size=20, weight="bold"),
-            text_color=("gray10", "white")
-        )
-        service_title.grid(row=0, column=0, sticky="w")
+        # Create cards for each strategy in horizontal layout
+        for idx, strategy in enumerate(strategies):
+            self.create_strategy_card(self.service_cards_frame, strategy, idx, column=idx)
 
-        self.status_badge = ctk.CTkLabel(
-            card_header,
-            text="已上线",
-            font=ctk.CTkFont(size=12, weight="bold"),
-            text_color="white",
-            fg_color=("#818CF8", "#818CF8"),
-            corner_radius=12,
-            padx=12,
-            pady=4
-        )
-        self.status_badge.grid(row=0, column=1, padx=10, sticky="e")
-
-        # Card description
-        service_desc = ctk.CTkLabel(
-            self.service_card,
-            text="结合两大核心插件优势，提供超低磨损率，是追求稳定高收益的最佳选择。",
-            font=ctk.CTkFont(size=13),
-            text_color=("gray50", "gray60"),
-            wraplength=800,
-            justify="left"
-        )
-        service_desc.grid(row=1, column=0, sticky="w", padx=25, pady=(0, 15))
-
-        # Status info
-        status_info_frame = ctk.CTkFrame(self.service_card, fg_color="transparent")
-        status_info_frame.grid(row=2, column=0, sticky="ew", padx=25, pady=(0, 20))
+        # Status indicator at bottom (shared across all strategies) - span all columns
+        status_info_frame = ctk.CTkFrame(self.service_cards_frame, fg_color="transparent")
+        status_info_frame.grid(row=1, column=0, columnspan=3, sticky="ew", padx=0, pady=(10, 0))
 
         status_icon_frame = ctk.CTkFrame(status_info_frame, fg_color="transparent")
         status_icon_frame.pack(side="left")
@@ -287,7 +275,7 @@ class LighterSigningServiceGUI(ctk.CTk):
 
         self.status_text = ctk.CTkLabel(
             status_info_frame,
-            text="超低磨损率 0.018%",
+            text="服务未运行",
             font=ctk.CTkFont(size=14),
             text_color=("gray40", "gray70")
         )
@@ -390,13 +378,107 @@ class LighterSigningServiceGUI(ctk.CTk):
         self.footer_frame = ctk.CTkFrame(self, corner_radius=0, fg_color=("gray90", "gray10"))
         self.footer_frame.grid(row=2, column=0, sticky="ew", padx=0, pady=0)
 
+        # Footer with social links
+        footer_content = ctk.CTkFrame(self.footer_frame, fg_color="transparent")
+        footer_content.pack(pady=12)
+
         self.footer_label = ctk.CTkLabel(
-            self.footer_frame,
-            text="AlphaAI Labs © 2025 | Lighter Signing Service",
+            footer_content,
+            text="AlphaLabs © 2025 | Signer Manager",
             font=ctk.CTkFont(size=11),
             text_color=("gray50", "gray60")
         )
-        self.footer_label.pack(pady=12)
+        self.footer_label.pack(side="left", padx=20)
+
+        # Social links
+        social_links_frame = ctk.CTkFrame(footer_content, fg_color="transparent")
+        social_links_frame.pack(side="left")
+
+        links = [
+            ("🌐 官网", "https://alphalabs.app"),
+            ("𝕏", "https://x.com/Alpha_alabs"),
+            ("📱 Telegram", "https://t.me/+DYoJd7HuN1kyNGE1")
+        ]
+
+        for text, url in links:
+            link_btn = ctk.CTkButton(
+                social_links_frame,
+                text=text,
+                font=ctk.CTkFont(size=10),
+                width=80,
+                height=24,
+                corner_radius=6,
+                fg_color="transparent",
+                border_width=1,
+                border_color=("gray70", "gray40"),
+                text_color=("gray40", "gray70"),
+                hover_color=("gray85", "gray25"),
+                command=lambda u=url: self.open_link(u)
+            )
+            link_btn.pack(side="left", padx=5)
+
+    def create_strategy_card(self, parent, strategy, index, column=0):
+        """Create a strategy information card"""
+        card = ctk.CTkFrame(
+            parent,
+            corner_radius=15,
+            fg_color=("gray95", "gray15"),
+            border_width=1,
+            border_color=("gray80", "gray25")
+        )
+        # Place in row 0, different columns for horizontal layout
+        card.grid(row=0, column=column, sticky="nsew", padx=(0 if column == 0 else 5, 0 if column == 2 else 5), pady=0)
+        card.grid_columnconfigure(0, weight=1)
+
+        # Card header
+        card_header = ctk.CTkFrame(card, fg_color="transparent")
+        card_header.grid(row=0, column=0, sticky="ew", padx=25, pady=(15, 8))
+        card_header.grid_columnconfigure(1, weight=1)
+
+        service_title = ctk.CTkLabel(
+            card_header,
+            text=strategy["name"],
+            font=ctk.CTkFont(size=16, weight="bold"),
+            text_color=("gray10", "white")
+        )
+        service_title.grid(row=0, column=0, sticky="w")
+
+        status_badge = ctk.CTkLabel(
+            card_header,
+            text=strategy["badge"],
+            font=ctk.CTkFont(size=11, weight="bold"),
+            text_color="white",
+            fg_color=strategy["badge_color"],
+            corner_radius=10,
+            padx=10,
+            pady=3
+        )
+        status_badge.grid(row=0, column=1, padx=10, sticky="e")
+
+        # Card description
+        service_desc = ctk.CTkLabel(
+            card,
+            text=strategy["desc"],
+            font=ctk.CTkFont(size=11),
+            text_color=("gray50", "gray60"),
+            wraplength=250,  # Reduced for horizontal layout
+            justify="left"
+        )
+        service_desc.grid(row=1, column=0, sticky="w", padx=20, pady=(0, 8))
+
+        # Wear rate
+        wear_rate_label = ctk.CTkLabel(
+            card,
+            text=strategy["wear_rate"],
+            font=ctk.CTkFont(size=12, weight="bold"),
+            text_color=("gray30", "gray80")
+        )
+        wear_rate_label.grid(row=2, column=0, sticky="w", padx=25, pady=(0, 15))
+
+    def open_link(self, url):
+        """Open URL in default browser"""
+        import webbrowser
+        webbrowser.open(url)
 
     def log(self, message: str, level: str = "INFO"):
         """Add a message to the log with color coding (thread-safe)"""
@@ -589,11 +671,7 @@ class LighterSigningServiceGUI(ctk.CTk):
                 text="●",
                 text_color=("#52C41A", "#52C41A")
             )
-            self.status_text.configure(text="服务运行中 - 超低磨损率 0.018%")
-            self.status_badge.configure(
-                text="运行中",
-                fg_color=("#52C41A", "#52C41A")
-            )
+            self.status_text.configure(text="服务运行中")
             self.start_button.configure(state="disabled")
             self.stop_button.configure(state="normal")
         else:
@@ -601,11 +679,7 @@ class LighterSigningServiceGUI(ctk.CTk):
                 text="●",
                 text_color=("#FF4D4F", "#FF4D4F")
             )
-            self.status_text.configure(text="超低磨损率 0.018%")
-            self.status_badge.configure(
-                text="已上线",
-                fg_color=("#818CF8", "#818CF8")
-            )
+            self.status_text.configure(text="服务未运行")
             self.start_button.configure(state="normal")
             self.stop_button.configure(state="disabled")
 
