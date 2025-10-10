@@ -546,10 +546,12 @@ class LighterSigningServiceGUI(ctk.CTk):
             self.log("Service is already running", "WARNING")
             return
 
+        # Update UI immediately to show we're starting
+        self.log("Starting service...", "INFO")
+        self.start_button.configure(state="disabled", text="启动中...")
+
         def start_task():
             try:
-                self.log("Starting service...", "INFO")
-
                 # Import uvicorn and the service app
                 import sys
                 import importlib.util
@@ -564,29 +566,35 @@ class LighterSigningServiceGUI(ctk.CTk):
                 main_file = self.service_dir / "main.py"
                 if not main_file.exists():
                     self.log("Service main.py not found", "ERROR")
+                    self.start_button.configure(state="normal", text="启动服务")
                     return
+
+                self.log("Loading service dependencies (this may take a moment on first run)...", "INFO")
 
                 # Load the service module
                 spec = importlib.util.spec_from_file_location("service_main", main_file)
                 if spec is None or spec.loader is None:
                     self.log("Failed to load service module", "ERROR")
+                    self.start_button.configure(state="normal", text="启动服务")
                     return
 
                 service_module = importlib.util.module_from_spec(spec)
                 sys.modules["service_main"] = service_module
 
-                # Execute the service module to get the FastAPI app
+                # Execute the service module to get the FastAPI app (this is slow on first run)
                 try:
                     spec.loader.exec_module(service_module)
                 except Exception as exec_error:
                     self.log(f"Service module load error: {str(exec_error)}", "ERROR")
                     import traceback
                     self.log(traceback.format_exc(), "ERROR")
+                    self.start_button.configure(state="normal", text="启动服务")
                     return
 
                 # Get the FastAPI app from the module
                 if not hasattr(service_module, 'app'):
                     self.log("Service module does not have 'app' attribute", "ERROR")
+                    self.start_button.configure(state="normal", text="启动服务")
                     return
 
                 app = service_module.app
@@ -638,6 +646,7 @@ class LighterSigningServiceGUI(ctk.CTk):
                 self.log(traceback.format_exc(), "ERROR")
                 self.service_running = False
                 self.service_process = None
+                self.start_button.configure(state="normal", text="启动服务")
                 self.update_ui_state()
 
         threading.Thread(target=start_task, daemon=True).start()

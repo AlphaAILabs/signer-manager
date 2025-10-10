@@ -51,14 +51,14 @@ jobs:
     - name: Create DMG
       run: |
         # Variables
-        APP_NAME="LighterSigningService"
+        APP_NAME="AlphaLabsSigner"
         VERSION="${GITHUB_REF#refs/tags/v}"
         if [ -z "$VERSION" ] || [ "$VERSION" = "$GITHUB_REF" ]; then
           VERSION="1.1.0"
         fi
         DMG_NAME="${APP_NAME}-${VERSION}-macOS"
         DMG_DIR="dmg_temp"
-        VOLUME_NAME="Lighter Signing Service"
+        VOLUME_NAME="AlphaLabs Signer"
         
         # Create temporary directory
         mkdir -p "${DMG_DIR}"
@@ -144,11 +144,11 @@ jobs:
 
         # Create Inno Setup script
         $issContent = @"
-        #define MyAppName "Lighter Signing Service"
+        #define MyAppName "AlphaLabs Signer"
         #define MyAppVersion "$version"
         #define MyAppPublisher "AlphaAI Labs"
-        #define MyAppURL "https://github.com/AlphaAILabs/lighter-signing-service"
-        #define MyAppExeName "LighterSigningService.exe"
+        #define MyAppURL "https://github.com/AlphaAILabs/signer-manager"
+        #define MyAppExeName "AlphaLabsSigner.exe"
 
         [Setup]
         AppId={{A8B9C0D1-E2F3-4A5B-6C7D-8E9F0A1B2C3D}
@@ -160,7 +160,7 @@ jobs:
         DefaultGroupName={#MyAppName}
         AllowNoIcons=yes
         OutputDir=dist
-        OutputBaseFilename=LighterSigningService-{#MyAppVersion}-Windows-Setup
+        OutputBaseFilename=AlphaLabsSigner-{#MyAppVersion}-Windows-Setup
         Compression=lzma
         SolidCompression=yes
         WizardStyle=modern

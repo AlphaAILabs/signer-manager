@@ -184,7 +184,7 @@ exe = EXE(
     a.zipfiles,
     a.datas,
     [],
-    name='LighterSigningService',
+    name='AlphaLabsSigner',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -204,12 +204,12 @@ exe = EXE(
 if sys.platform == 'darwin':
     app = BUNDLE(
         exe,
-        name='LighterSigningService.app',
+        name='AlphaLabsSigner.app',
         icon='logo.png',
-        bundle_identifier='com.alphalabs.lightersigningservice',
+        bundle_identifier='com.alphalabs.signer',
         info_plist={
-            'CFBundleName': 'Lighter Signing Service',
-            'CFBundleDisplayName': 'Lighter Signing Service',
+            'CFBundleName': 'AlphaLabs Signer',
+            'CFBundleDisplayName': 'AlphaLabs Signer',
             'CFBundleVersion': '1.1.0',
             'CFBundleShortVersionString': '1.1.0',
             'NSHighResolutionCapable': 'True',
