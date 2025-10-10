@@ -9,20 +9,9 @@ on:
 permissions:
   contents: write
   packages: write
-  actions: write
 
 jobs:
-  cleanup:
-    runs-on: ubuntu-latest
-    steps:
-    - name: Delete old artifacts
-      uses: c-hive/gha-remove-artifacts@v1
-      with:
-        age: '1 day'
-        skip-recent: 3
-
   build-macos:
-    needs: cleanup
     runs-on: macos-latest
 
     steps:
@@ -92,12 +81,15 @@ jobs:
         echo "DMG created: dist/${DMG_NAME}.dmg"
         ls -lh dist/
     
-    - name: Upload macOS artifacts
-      uses: actions/upload-artifact@v4
+    - name: Upload to Release
+      uses: softprops/action-gh-release@v2
+      if: startsWith(github.ref, 'refs/tags/')
       with:
-        name: macos-dmg
-        path: dist/*.dmg
-        retention-days: 30
+        files: dist/*.dmg
+        draft: false
+        prerelease: false
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   build-windows:
     runs-on: windows-latest
@@ -205,36 +197,13 @@ jobs:
         Get-ChildItem dist\
       shell: pwsh
     
-    - name: Upload Windows artifacts
-      uses: actions/upload-artifact@v4
-      with:
-        name: windows-installer
-        path: |
-          dist/*.exe
-          dist/*-Setup.exe
-        retention-days: 30
-
-  create-release:
-    needs: [build-macos, build-windows]
-    runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/') && always()
-    
-    steps:
-    - name: Download all artifacts
-      uses: actions/download-artifact@v4
-      with:
-        path: artifacts
-    
-    - name: Create Release
+    - name: Upload to Release
       uses: softprops/action-gh-release@v2
+      if: startsWith(github.ref, 'refs/tags/')
       with:
-        files: |
-          artifacts/macos-dmg/*.dmg
-          artifacts/windows-installer/*-Setup.exe
+        files: dist/*-Setup.exe
         draft: false
         prerelease: false
-        generate_release_notes: true
-        fail_on_unmatched_files: false
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
