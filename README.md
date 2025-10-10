@@ -34,8 +34,8 @@ AlphaLabs Signer 是一款专为 Lighter 协议设计的本地签名服务管理
 
 | 操作系统 | 架构 | 下载链接 |
 |---------|------|---------|
-| **macOS** | Apple Silicon (M1/M2/M3) & Intel | [下载 DMG](https://github.com/AlphaAILabs/signer-manager/releases/latest) |
-| **Windows** | x64 | [下载安装包](https://github.com/AlphaAILabs/signer-manager/releases/latest) |
+| 🍎 **macOS** | Apple Silicon (M1/M2/M3) & Intel | [下载 DMG](https://github.com/AlphaAILabs/signer-manager/releases/latest) |
+| 🪟 **Windows** | x64 | [下载安装包](https://github.com/AlphaAILabs/signer-manager/releases/latest) |
 
 ### 安装说明
 
@@ -113,6 +113,14 @@ AlphaLabs Signer 是一款专为 Lighter 协议设计的本地签名服务管理
 - ✅ 服务状态监控
 - ✅ 深色/浅色主题切换
 - ✅ 端口配置（默认 10000）
+
+---
+
+## 🔗 相关链接
+
+- 🌐 [官网](https://alphalabs.app)
+- 🐦 [Twitter/X](https://x.com/Alpha_alabs)
+- 💬 [Telegram 社区](https://t.me/+DYoJd7HuN1kyNGE1)
 
 ---
 
