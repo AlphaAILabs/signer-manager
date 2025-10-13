@@ -36,6 +36,7 @@ class StrOrErr(ctypes.Structure):
 def _initialize_signer():
     is_linux = platform.system() == "Linux"
     is_mac = platform.system() == "Darwin"
+    is_windows = platform.system() == "Windows"
     is_x64 = platform.machine().lower() in ("amd64", "x86_64")
     is_arm = platform.machine().lower() == "arm64"
 
@@ -48,9 +49,12 @@ def _initialize_signer():
     elif is_linux and is_x64:
         logging.debug("Detected x64/amd architecture on Linux.")
         return ctypes.CDLL(os.path.join(path_to_signer_folders, "signer-amd64.so"))
+    elif is_windows and is_x64:
+        logging.debug("Detected x64/amd architecture on Windows.")
+        return ctypes.CDLL(os.path.join(path_to_signer_folders, "signer-amd64.dll"))
     else:
         raise Exception(
-            f"Unsupported platform/architecture: {platform.system()}/{platform.machine()} only supports Linux(x86) and Darwin(arm64)"
+            f"Unsupported platform/architecture: {platform.system()}/{platform.machine()}"
         )
 
 
