@@ -25,6 +25,19 @@ app.add_middleware(
 )
 
 
+@app.on_event("startup")
+async def startup_event():
+    """Check if signer is initialized on startup"""
+    if signer is None:
+        logging.error("=" * 60)
+        logging.error("CRITICAL: Signer failed to initialize!")
+        logging.error(f"Platform: {platform.system()}/{platform.machine()}")
+        logging.error("The service will start but signing operations will fail.")
+        logging.error("=" * 60)
+    else:
+        logging.info(f"Signer initialized successfully on {platform.system()}/{platform.machine()}")
+
+
 class ApiKeyResponse(ctypes.Structure):
     _fields_ = [("privateKey", ctypes.c_char_p), ("publicKey", ctypes.c_char_p), ("err", ctypes.c_char_p)]
 
@@ -895,11 +908,14 @@ async def create_auth_token(request: CreateAuthTokenRequest):
 
 @app.get("/health")
 async def health():
+    signer_status = "initialized" if signer else "failed"
     return {
-        "status": "healthy",
+        "status": "healthy" if signer else "degraded",
         "version": "3.0.0",
         "thread_safe": True,
         "lock_type": "global",
+        "signer": signer_status,
+        "platform": f"{platform.system()}/{platform.machine()}",
         "note": "All signing operations are serialized for safety"
     }
 

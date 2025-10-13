@@ -626,6 +626,11 @@ class LighterSigningServiceGUI(ctk.CTk):
                     sys.stderr = stream_logger
 
                     try:
+                        # On Windows, we need to set the event loop policy explicitly
+                        # to avoid issues with ProactorEventLoop in packaged apps
+                        if sys.platform == 'win32':
+                            asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+
                         config = uvicorn.Config(
                             app=app,
                             host="0.0.0.0",
@@ -637,8 +642,13 @@ class LighterSigningServiceGUI(ctk.CTk):
 
                         self.log(f"Service started on port {self.service_port}", "SUCCESS")
 
-                        # Run the server (this blocks until stopped)
-                        asyncio.run(self.uvicorn_server.serve())
+                        # Create and run event loop manually for better Windows compatibility
+                        loop = asyncio.new_event_loop()
+                        asyncio.set_event_loop(loop)
+                        try:
+                            loop.run_until_complete(self.uvicorn_server.serve())
+                        finally:
+                            loop.close()
                     finally:
                         # Restore stdout/stderr
                         sys.stdout = old_stdout
