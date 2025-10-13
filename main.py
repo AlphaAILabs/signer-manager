@@ -15,6 +15,7 @@ import io
 import traceback
 import asyncio
 import webbrowser
+import socket
 from pathlib import Path
 from typing import Optional
 from PIL import Image
@@ -89,6 +90,60 @@ class StreamToLogger:
 
     def fileno(self):
         return -1
+
+
+def is_port_in_use(port: int) -> bool:
+    """Check if a port is in use"""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        try:
+            s.bind(('0.0.0.0', port))
+            return False
+        except OSError:
+            return True
+
+
+def get_process_using_port(port: int) -> Optional[int]:
+    """Get PID of process using the specified port (Windows only)"""
+    if sys.platform != 'win32':
+        return None
+
+    try:
+        import subprocess
+        result = subprocess.run(
+            ['netstat', '-ano'],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+
+        for line in result.stdout.splitlines():
+            if f':{port}' in line and 'LISTENING' in line:
+                parts = line.split()
+                if len(parts) >= 5:
+                    try:
+                        return int(parts[-1])
+                    except ValueError:
+                        pass
+    except Exception:
+        pass
+    return None
+
+
+def kill_process_on_port(port: int) -> bool:
+    """Kill the process using the specified port (Windows only)"""
+    if sys.platform != 'win32':
+        return False
+
+    pid = get_process_using_port(port)
+    if pid:
+        try:
+            subprocess.run(['taskkill', '/F', '/PID', str(pid)],
+                         capture_output=True, timeout=10)
+            time.sleep(1)  # Wait for process to die
+            return True
+        except Exception:
+            pass
+    return False
 
 
 class LighterSigningServiceGUI(ctk.CTk):
@@ -558,6 +613,37 @@ class LighterSigningServiceGUI(ctk.CTk):
 
         def start_task():
             try:
+                # Check and clean up port before starting
+                self.log(f"Checking port {self.service_port}...", "INFO")
+
+                if is_port_in_use(self.service_port):
+                    self.log(f"Port {self.service_port} is in use, attempting to clean up...", "WARNING")
+
+                    if sys.platform == 'win32':
+                        pid = get_process_using_port(self.service_port)
+                        if pid:
+                            self.log(f"Found process {pid} using port {self.service_port}", "INFO")
+                            if kill_process_on_port(self.service_port):
+                                self.log("Old process terminated successfully", "SUCCESS")
+                                # Wait a bit more to ensure port is released
+                                time.sleep(2)
+                            else:
+                                self.log("Failed to terminate old process", "ERROR")
+                                self.log("Please manually close the application using port 10000", "ERROR")
+                                self.start_button.configure(state="normal", text="启动服务")
+                                return
+
+                    # Double check port is now free
+                    if is_port_in_use(self.service_port):
+                        self.log(f"Port {self.service_port} is still in use!", "ERROR")
+                        self.log("Please wait 2 minutes or restart your computer", "ERROR")
+                        self.start_button.configure(state="normal", text="启动服务")
+                        return
+                    else:
+                        self.log(f"Port {self.service_port} is now available", "SUCCESS")
+                else:
+                    self.log(f"Port {self.service_port} is available", "SUCCESS")
+
                 # Import uvicorn and the service app
                 import importlib.util
                 import uvicorn
@@ -636,7 +722,10 @@ class LighterSigningServiceGUI(ctk.CTk):
                             host="0.0.0.0",
                             port=self.service_port,
                             log_level="info",
-                            access_log=True
+                            access_log=True,
+                            timeout_graceful_shutdown=1,  # Fast shutdown to release port quickly
+                            limit_concurrency=100,
+                            backlog=50
                         )
                         self.uvicorn_server = uvicorn.Server(config)
 
@@ -685,11 +774,26 @@ class LighterSigningServiceGUI(ctk.CTk):
             if self.uvicorn_server:
                 self.uvicorn_server.should_exit = True
 
+                # Wait for server to gracefully shutdown
+                max_wait = 5  # seconds
+                waited = 0
+                while waited < max_wait:
+                    if not is_port_in_use(self.service_port):
+                        break
+                    time.sleep(0.5)
+                    waited += 0.5
+
             self.service_running = False
             self.service_process = None
             self.uvicorn_server = None
             self.update_ui_state()
-            self.log("Service stopped successfully", "SUCCESS")
+
+            # Verify port is released
+            if is_port_in_use(self.service_port):
+                self.log(f"Warning: Port {self.service_port} may still be in use", "WARNING")
+                self.log("Please wait a moment before restarting", "WARNING")
+            else:
+                self.log("Service stopped successfully", "SUCCESS")
 
         except Exception as e:
             self.log(f"Error stopping service: {str(e)}", "ERROR")
@@ -718,7 +822,15 @@ class LighterSigningServiceGUI(ctk.CTk):
         if self.service_running:
             self.log("Stopping service before exit...", "INFO")
             self.stop_service()
-            time.sleep(1)
+            # Give more time for graceful shutdown
+            time.sleep(2)
+
+            # Force kill if still running (Windows only)
+            if sys.platform == 'win32' and is_port_in_use(self.service_port):
+                self.log("Force terminating service...", "WARNING")
+                kill_process_on_port(self.service_port)
+                time.sleep(1)
+
         self.destroy()
 
     def toggle_theme(self):
