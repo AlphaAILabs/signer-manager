@@ -12,6 +12,9 @@ import threading
 import time
 import logging
 import io
+import traceback
+import asyncio
+import webbrowser
 from pathlib import Path
 from typing import Optional
 from PIL import Image
@@ -54,25 +57,29 @@ class StreamToLogger:
         self.buffer = ""
 
     def write(self, message):
-        if message and message.strip():
-            msg = message.strip()
+        try:
+            if message and message.strip():
+                msg = message.strip()
 
-            # Determine level based on message content
-            level = self.default_level
-            if "ERROR" in msg or "CRITICAL" in msg or "Exception" in msg or "Traceback" in msg:
-                level = "ERROR"
-            elif "WARNING" in msg or "WARN" in msg:
-                level = "WARNING"
-            elif "INFO:" in msg or "DEBUG:" in msg:
-                # Remove the INFO: or DEBUG: prefix for cleaner display
-                msg = msg.replace("INFO:", "").replace("DEBUG:", "").strip()
-                level = "SERVICE"
-            elif "Started server" in msg or "Uvicorn running" in msg or "Application startup" in msg:
-                level = "SERVICE"
-            elif "Shutting down" in msg or "shutdown" in msg.lower():
-                level = "SERVICE"
+                # Determine level based on message content
+                level = self.default_level
+                if "ERROR" in msg or "CRITICAL" in msg or "Exception" in msg or "Traceback" in msg:
+                    level = "ERROR"
+                elif "WARNING" in msg or "WARN" in msg:
+                    level = "WARNING"
+                elif "INFO:" in msg or "DEBUG:" in msg:
+                    # Remove the INFO: or DEBUG: prefix for cleaner display
+                    msg = msg.replace("INFO:", "").replace("DEBUG:", "").strip()
+                    level = "SERVICE"
+                elif "Started server" in msg or "Uvicorn running" in msg or "Application startup" in msg:
+                    level = "SERVICE"
+                elif "Shutting down" in msg or "shutdown" in msg.lower():
+                    level = "SERVICE"
 
-            self.log_callback(msg, level)
+                self.log_callback(msg, level)
+        except Exception:
+            # Silently ignore logging errors to prevent infinite loops
+            pass
 
     def flush(self):
         pass
@@ -477,7 +484,6 @@ class LighterSigningServiceGUI(ctk.CTk):
 
     def open_link(self, url):
         """Open URL in default browser"""
-        import webbrowser
         webbrowser.open(url)
 
     def log(self, message: str, level: str = "INFO"):
@@ -553,7 +559,6 @@ class LighterSigningServiceGUI(ctk.CTk):
         def start_task():
             try:
                 # Import uvicorn and the service app
-                import sys
                 import importlib.util
                 import uvicorn
 
@@ -586,7 +591,6 @@ class LighterSigningServiceGUI(ctk.CTk):
                     spec.loader.exec_module(service_module)
                 except Exception as exec_error:
                     self.log(f"Service module load error: {str(exec_error)}", "ERROR")
-                    import traceback
                     self.log(traceback.format_exc(), "ERROR")
                     self.start_button.configure(state="normal", text="启动服务")
                     return
@@ -605,11 +609,21 @@ class LighterSigningServiceGUI(ctk.CTk):
 
                 # Start uvicorn server
                 try:
+                    # Configure logging before redirecting stdout/stderr
+                    # This prevents "AttributeError: 'NoneType' object has no attribute 'write'" on Windows
+                    logging.getLogger('asyncio').setLevel(logging.WARNING)
+
+                    # Ensure root logger handlers are configured
+                    for handler in logging.root.handlers[:]:
+                        logging.root.removeHandler(handler)
+
                     # Redirect stdout/stderr to capture all output
                     old_stdout = sys.stdout
                     old_stderr = sys.stderr
-                    sys.stdout = StreamToLogger(self.log, "SERVICE")
-                    sys.stderr = StreamToLogger(self.log, "SERVICE")  # uvicorn logs to stderr
+
+                    stream_logger = StreamToLogger(self.log, "SERVICE")
+                    sys.stdout = stream_logger
+                    sys.stderr = stream_logger
 
                     try:
                         config = uvicorn.Config(
@@ -624,7 +638,6 @@ class LighterSigningServiceGUI(ctk.CTk):
                         self.log(f"Service started on port {self.service_port}", "SUCCESS")
 
                         # Run the server (this blocks until stopped)
-                        import asyncio
                         asyncio.run(self.uvicorn_server.serve())
                     finally:
                         # Restore stdout/stderr
@@ -633,7 +646,6 @@ class LighterSigningServiceGUI(ctk.CTk):
 
                 except Exception as server_error:
                     self.log(f"Server error: {str(server_error)}", "ERROR")
-                    import traceback
                     self.log(traceback.format_exc(), "ERROR")
                 finally:
                     self.service_running = False
@@ -642,7 +654,6 @@ class LighterSigningServiceGUI(ctk.CTk):
 
             except Exception as e:
                 self.log(f"Failed to start service: {str(e)}", "ERROR")
-                import traceback
                 self.log(traceback.format_exc(), "ERROR")
                 self.service_running = False
                 self.service_process = None
