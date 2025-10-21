@@ -111,16 +111,37 @@ def get_local_ip() -> str:
         s.connect(('8.8.8.8', 80))
         local_ip = s.getsockname()[0]
         s.close()
-        return local_ip
+
+        # Filter out proxy/VPN virtual IPs (like Surge TUN: 198.18.0.0/15)
+        # Only accept private network IPs: 10.x.x.x, 172.16-31.x.x, 192.168.x.x
+        if (local_ip.startswith('10.') or
+            local_ip.startswith('192.168.') or
+            (local_ip.startswith('172.') and 16 <= int(local_ip.split('.')[1]) <= 31)):
+            return local_ip
+
+        # If socket method returned a proxy IP, try platform-specific methods
+        raise Exception("Socket method returned non-private IP, trying fallback")
+
     except Exception:
         # Method 2: Platform-specific fallback
         try:
             import subprocess
             if sys.platform == 'darwin':  # macOS
-                result = subprocess.run(['ipconfig', 'getifaddr', 'en0'],
-                                       capture_output=True, text=True, timeout=2)
-                if result.returncode == 0 and result.stdout.strip():
-                    return result.stdout.strip()
+                # Try to get IP from common network interfaces
+                for interface in ['en0', 'en1', 'en2']:
+                    try:
+                        result = subprocess.run(['ipconfig', 'getifaddr', interface],
+                                               capture_output=True, text=True, timeout=2)
+                        if result.returncode == 0 and result.stdout.strip():
+                            ip = result.stdout.strip()
+                            # Filter out proxy/VPN IPs
+                            if (ip.startswith('10.') or
+                                ip.startswith('192.168.') or
+                                (ip.startswith('172.') and 16 <= int(ip.split('.')[1]) <= 31)):
+                                return ip
+                    except Exception:
+                        continue
+
             elif sys.platform == 'win32':  # Windows
                 result = subprocess.run(['ipconfig'],
                                        capture_output=True, text=True, timeout=2)
@@ -131,18 +152,25 @@ def get_local_ip() -> str:
                             parts = line.split(':')
                             if len(parts) >= 2:
                                 ip = parts[1].strip()
-                                # Filter out localhost and empty
-                                if ip and not ip.startswith('127.') and '.' in ip:
+                                # Filter out localhost, empty, and proxy IPs
+                                if (ip and not ip.startswith('127.') and '.' in ip and
+                                    (ip.startswith('10.') or
+                                     ip.startswith('192.168.') or
+                                     (ip.startswith('172.') and 16 <= int(ip.split('.')[1]) <= 31))):
                                     return ip
+
             elif sys.platform.startswith('linux'):  # Linux
                 # Try hostname -I first
                 result = subprocess.run(['hostname', '-I'],
                                        capture_output=True, text=True, timeout=2)
                 if result.returncode == 0 and result.stdout.strip():
-                    # Get first IP from output
+                    # Get first private IP from output
                     ips = result.stdout.strip().split()
-                    if ips:
-                        return ips[0]
+                    for ip in ips:
+                        if (ip.startswith('10.') or
+                            ip.startswith('192.168.') or
+                            (ip.startswith('172.') and 16 <= int(ip.split('.')[1]) <= 31)):
+                            return ip
         except Exception:
             pass
         return "Unable to detect"
