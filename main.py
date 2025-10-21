@@ -102,6 +102,52 @@ def is_port_in_use(port: int) -> bool:
             return True
 
 
+def get_local_ip() -> str:
+    """Get local network IP address (supports macOS, Windows, Linux)"""
+    try:
+        # Method 1: Universal socket method (works for all platforms)
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        # Connect to an external address (doesn't actually send data)
+        s.connect(('8.8.8.8', 80))
+        local_ip = s.getsockname()[0]
+        s.close()
+        return local_ip
+    except Exception:
+        # Method 2: Platform-specific fallback
+        try:
+            import subprocess
+            if sys.platform == 'darwin':  # macOS
+                result = subprocess.run(['ipconfig', 'getifaddr', 'en0'],
+                                       capture_output=True, text=True, timeout=2)
+                if result.returncode == 0 and result.stdout.strip():
+                    return result.stdout.strip()
+            elif sys.platform == 'win32':  # Windows
+                result = subprocess.run(['ipconfig'],
+                                       capture_output=True, text=True, timeout=2)
+                if result.returncode == 0:
+                    # Parse ipconfig output for IPv4 address
+                    for line in result.stdout.split('\n'):
+                        if 'IPv4' in line or 'IP Address' in line:
+                            parts = line.split(':')
+                            if len(parts) >= 2:
+                                ip = parts[1].strip()
+                                # Filter out localhost and empty
+                                if ip and not ip.startswith('127.') and '.' in ip:
+                                    return ip
+            elif sys.platform.startswith('linux'):  # Linux
+                # Try hostname -I first
+                result = subprocess.run(['hostname', '-I'],
+                                       capture_output=True, text=True, timeout=2)
+                if result.returncode == 0 and result.stdout.strip():
+                    # Get first IP from output
+                    ips = result.stdout.strip().split()
+                    if ips:
+                        return ips[0]
+        except Exception:
+            pass
+        return "Unable to detect"
+
+
 def get_process_using_port(port: int) -> Optional[int]:
     """Get PID of process using the specified port (Windows only)"""
     if sys.platform != 'win32':
@@ -152,8 +198,8 @@ class LighterSigningServiceGUI(ctk.CTk):
 
         # Configure window
         self.title("AlphaLabs Signer Manager")
-        self.geometry("900x700")
-        self.minsize(800, 600)
+        self.geometry("900x800")
+        self.minsize(800, 650)
 
         # Set window icon
         try:
@@ -191,6 +237,9 @@ class LighterSigningServiceGUI(ctk.CTk):
 
         self.service_dir = application_path / "service"
         self.service_port = 10000
+
+        # Get local IP address
+        self.local_ip = get_local_ip()
 
         # Theme state
         self.current_theme = "dark"
@@ -283,7 +332,7 @@ class LighterSigningServiceGUI(ctk.CTk):
         self.main_frame = ctk.CTkFrame(self, corner_radius=10)
         self.main_frame.grid(row=1, column=0, sticky="nsew", padx=20, pady=20)
         self.main_frame.grid_columnconfigure(0, weight=1)
-        self.main_frame.grid_rowconfigure(2, weight=1)
+        self.main_frame.grid_rowconfigure(3, weight=1)
 
         # Service Cards Container - Horizontal Layout
         self.service_cards_frame = ctk.CTkFrame(self.main_frame, fg_color="transparent")
@@ -385,7 +434,107 @@ class LighterSigningServiceGUI(ctk.CTk):
         )
         self.stop_button.grid(row=0, column=1, padx=10, pady=20, sticky="ew")
 
+        # Access Address Section - Modern style
+        self.address_frame = ctk.CTkFrame(
+            self.main_frame,
+            corner_radius=15,
+            fg_color=("gray95", "gray15"),
+            border_width=1,
+            border_color=("gray80", "gray25")
+        )
+        self.address_frame.grid(row=2, column=0, sticky="ew", padx=20, pady=(0, 10))
+        self.address_frame.grid_columnconfigure(0, weight=1)
 
+        # Section Header
+        address_header = ctk.CTkFrame(self.address_frame, fg_color="transparent")
+        address_header.grid(row=0, column=0, sticky="ew", padx=15, pady=(10, 5))
+
+        address_title = ctk.CTkLabel(
+            address_header,
+            text="📡 服务访问地址",
+            font=ctk.CTkFont(size=13, weight="bold"),
+            text_color=("gray10", "white")
+        )
+        address_title.pack(side="left")
+
+        # Chrome Browser Address
+        chrome_container = ctk.CTkFrame(self.address_frame, fg_color="transparent")
+        chrome_container.grid(row=1, column=0, sticky="ew", padx=15, pady=(0, 4))
+        chrome_container.grid_columnconfigure(1, weight=1)
+
+        chrome_icon_label = ctk.CTkLabel(
+            chrome_container,
+            text="🌐 Chrome浏览器:",
+            font=ctk.CTkFont(size=11),
+            text_color=("gray30", "gray80")
+        )
+        chrome_icon_label.grid(row=0, column=0, sticky="w", padx=(0, 8))
+
+        self.localhost_address = ctk.CTkLabel(
+            chrome_container,
+            text=f"http://localhost:{self.service_port}",
+            font=ctk.CTkFont(size=11, family="Monaco"),
+            text_color=("#818CF8", "#818CF8")
+        )
+        self.localhost_address.grid(row=0, column=1, sticky="w")
+
+        self.copy_localhost_btn = ctk.CTkButton(
+            chrome_container,
+            text="📋",
+            command=lambda: self.copy_address(f"http://localhost:{self.service_port}"),
+            font=ctk.CTkFont(size=10),
+            width=45,
+            height=22,
+            corner_radius=5,
+            fg_color=("#818CF8", "#818CF8"),
+            hover_color=("#6366F1", "#6366F1")
+        )
+        self.copy_localhost_btn.grid(row=0, column=2, padx=(8, 0))
+
+        # Fingerprint Browser Address
+        fingerprint_container = ctk.CTkFrame(self.address_frame, fg_color="transparent")
+        fingerprint_container.grid(row=2, column=0, sticky="ew", padx=15, pady=(0, 4))
+        fingerprint_container.grid_columnconfigure(1, weight=1)
+
+        fingerprint_icon_label = ctk.CTkLabel(
+            fingerprint_container,
+            text="🎭 指纹浏览器:",
+            font=ctk.CTkFont(size=11),
+            text_color=("gray30", "gray80")
+        )
+        fingerprint_icon_label.grid(row=0, column=0, sticky="w", padx=(0, 8))
+
+        lan_address = f"http://{self.local_ip}:{self.service_port}" if self.local_ip != "Unable to detect" else "无法检测到局域网IP"
+        self.lan_address_label = ctk.CTkLabel(
+            fingerprint_container,
+            text=lan_address,
+            font=ctk.CTkFont(size=11, family="Monaco"),
+            text_color=("#52C41A", "#52C41A") if self.local_ip != "Unable to detect" else ("#FF4D4F", "#FF4D4F")
+        )
+        self.lan_address_label.grid(row=0, column=1, sticky="w")
+
+        self.copy_lan_btn = ctk.CTkButton(
+            fingerprint_container,
+            text="📋",
+            command=lambda: self.copy_address(lan_address),
+            font=ctk.CTkFont(size=10),
+            width=45,
+            height=22,
+            corner_radius=5,
+            fg_color=("#52C41A", "#52C41A"),
+            hover_color=("#389E0D", "#389E0D"),
+            state="normal" if self.local_ip != "Unable to detect" else "disabled"
+        )
+        self.copy_lan_btn.grid(row=0, column=2, padx=(8, 0))
+
+        # Hint text
+        hint_text = ctk.CTkLabel(
+            self.address_frame,
+            text="💡 MoreLogin等指纹浏览器请使用上方IP地址",
+            font=ctk.CTkFont(size=9),
+            text_color=("gray50", "gray60")
+        )
+        hint_text.grid(row=3, column=0, sticky="w", padx=15, pady=(2, 8))
 
         # Log Section - Modern style
         self.log_frame = ctk.CTkFrame(
@@ -395,7 +544,7 @@ class LighterSigningServiceGUI(ctk.CTk):
             border_width=1,
             border_color=("gray80", "gray25")
         )
-        self.log_frame.grid(row=2, column=0, sticky="nsew", padx=20, pady=(10, 20))
+        self.log_frame.grid(row=3, column=0, sticky="nsew", padx=20, pady=(10, 20))
         self.log_frame.grid_columnconfigure(0, weight=1)
         self.log_frame.grid_rowconfigure(1, weight=1)
 
@@ -540,6 +689,16 @@ class LighterSigningServiceGUI(ctk.CTk):
     def open_link(self, url):
         """Open URL in default browser"""
         webbrowser.open(url)
+
+    def copy_address(self, address: str):
+        """Copy address to clipboard"""
+        try:
+            self.clipboard_clear()
+            self.clipboard_append(address)
+            self.update()  # Required for clipboard to work on some platforms
+            self.log(f"已复制地址: {address}", "SUCCESS")
+        except Exception as e:
+            self.log(f"复制失败: {str(e)}", "ERROR")
 
     def log(self, message: str, level: str = "INFO"):
         """Add a message to the log with color coding (thread-safe)"""
@@ -814,7 +973,7 @@ class LighterSigningServiceGUI(ctk.CTk):
                 text_color=("#FF4D4F", "#FF4D4F")
             )
             self.status_text.configure(text="服务未运行")
-            self.start_button.configure(state="normal")
+            self.start_button.configure(state="normal", text="▶  启动服务")
             self.stop_button.configure(state="disabled")
 
     def on_closing(self):
