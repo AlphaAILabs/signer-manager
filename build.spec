@@ -44,6 +44,7 @@ for package in packages_to_collect:
 # Collect all service files
 service_datas = [
     ('service/main.py', 'service'),
+    ('service/nonce_manager.py', 'service'),  # Critical: nonce management module
     ('service/requirements.txt', 'service'),
     ('service/README.md', 'service'),
     ('service/signers/README.md', 'service/signers'),
