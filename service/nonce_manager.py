@@ -11,38 +11,9 @@ import aiohttp
 logger = logging.getLogger(__name__)
 
 
-async def get_nonce_from_api(api_url: str, account_index: int, api_key_index: int) -> int:
-    """
-    Fetch the next nonce from Lighter API
-
-    Args:
-        api_url: Lighter API base URL
-        account_index: Account index
-        api_key_index: API key index
-
-    Returns:
-        Next nonce value
-    """
-    url = f"{api_url}/api/v1/nextNonce"
-    params = {"account_index": account_index, "api_key_index": api_key_index}
-
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=5)) as resp:
-                if resp.status != 200:
-                    error_text = await resp.text()
-                    raise Exception(f"Failed to get nonce (status {resp.status}): {error_text}")
-                data = await resp.json()
-                nonce = data.get("nonce")
-                if nonce is None:
-                    raise Exception(f"Invalid API response: {data}")
-                logger.debug(f"Fetched nonce from API: account={account_index}, api_key={api_key_index}, nonce={nonce}")
-                return int(nonce)
-    except asyncio.TimeoutError:
-        raise Exception("Timeout fetching nonce from API")
-    except Exception as e:
-        logger.error(f"Error fetching nonce from API: {e}")
-        raise
+# REMOVED: Signer-manager should NEVER access Lighter API directly
+# This would expose signer-manager's IP instead of the client's IP
+# Clients should fetch nonce themselves and pass it to signer-manager
 
 
 class OptimisticNonceManager:
@@ -68,29 +39,27 @@ class OptimisticNonceManager:
         """
         Initialize nonce for a new account/api_key pair
 
+        IMPORTANT: Signer-manager starts from 0. Clients MUST fetch the real nonce
+        from Lighter API themselves and pass it in signing requests.
+        This ensures the client's IP is visible to Lighter, not the signer's IP.
+
         Args:
             account_index: Account index
             api_key_index: API key index
-            api_url: Lighter API URL
+            api_url: Lighter API URL (stored for reference only)
         """
         async with self.lock:
-            # Store API URL
+            # Store API URL for reference only (not used to fetch nonce)
             self.api_urls[account_index] = api_url
 
             if account_index not in self.nonces:
                 self.nonces[account_index] = {}
 
             if api_key_index not in self.nonces[account_index]:
-                try:
-                    # Fetch current nonce from API
-                    nonce = await get_nonce_from_api(api_url, account_index, api_key_index)
-                    # Start from current - 1 (will be incremented on first use)
-                    self.nonces[account_index][api_key_index] = nonce - 1
-                    logger.info(f"Initialized nonce: account={account_index}, api_key={api_key_index}, nonce={nonce - 1}")
-                except Exception as e:
-                    # If API fetch fails, start from 0
-                    logger.warning(f"Could not fetch initial nonce from API: {e}, starting from 0")
-                    self.nonces[account_index][api_key_index] = 0
+                # Always start from 0
+                # Client is responsible for passing correct nonce from Lighter API
+                self.nonces[account_index][api_key_index] = 0
+                logger.info(f"Initialized nonce cache: account={account_index}, api_key={api_key_index}, starting from 0")
 
     async def get_next_nonce(
         self,
@@ -117,19 +86,12 @@ class OptimisticNonceManager:
                 self.nonces[account_index] = {}
 
             if api_key_index not in self.nonces[account_index]:
-                # Initialize on-the-fly
+                # Initialize on-the-fly - always start from 0
+                # Client must provide real nonce from Lighter API
                 if api_url:
                     self.api_urls[account_index] = api_url
-                    try:
-                        nonce = await get_nonce_from_api(api_url, account_index, api_key_index)
-                        self.nonces[account_index][api_key_index] = nonce - 1
-                    except Exception as e:
-                        logger.warning(f"Could not fetch nonce from API: {e}, starting from 0")
-                        self.nonces[account_index][api_key_index] = 0
-                else:
-                    # No API URL, start from 0
-                    logger.warning(f"No API URL for account={account_index}, starting nonce from 0")
-                    self.nonces[account_index][api_key_index] = 0
+                self.nonces[account_index][api_key_index] = 0
+                logger.info(f"On-the-fly nonce init: account={account_index}, api_key={api_key_index}, starting from 0")
 
             # If client provides nonce >= 0, respect it (backward compatibility)
             # But update our cache to avoid going backwards
@@ -167,27 +129,27 @@ class OptimisticNonceManager:
 
     async def hard_refresh_nonce(self, account_index: int, api_key_index: int):
         """
-        Force refresh nonce from API (used when 'invalid nonce' error)
+        Handle 'invalid nonce' error by rolling back
+
+        IMPORTANT: Signer-manager does NOT fetch nonce from Lighter API to avoid IP exposure.
+        When 'invalid nonce' occurs, client should:
+        1. Fetch fresh nonce from Lighter API (using client's own IP)
+        2. Retry the signing request with the fresh nonce
 
         Args:
             account_index: Account index
             api_key_index: API key index
         """
         async with self.lock:
-            api_url = self.api_urls.get(account_index)
-            if not api_url:
-                logger.error(f"Cannot hard refresh: no API URL for account={account_index}")
-                return
-
-            try:
-                nonce = await get_nonce_from_api(api_url, account_index, api_key_index)
-                if account_index not in self.nonces:
-                    self.nonces[account_index] = {}
-                old_nonce = self.nonces[account_index].get(api_key_index, -1)
-                self.nonces[account_index][api_key_index] = nonce - 1
-                logger.info(f"Hard refreshed nonce: account={account_index}, api_key={api_key_index}, {old_nonce} → {nonce - 1}")
-            except Exception as e:
-                logger.error(f"Failed to hard refresh nonce: {e}")
+            logger.error(
+                f"Invalid nonce error for account={account_index}, api_key={api_key_index}. "
+                f"Client should fetch fresh nonce from Lighter API and retry."
+            )
+            # Rollback the cached nonce so it can be retried
+            if account_index in self.nonces and api_key_index in self.nonces[account_index]:
+                old_nonce = self.nonces[account_index][api_key_index]
+                self.nonces[account_index][api_key_index] = max(0, old_nonce - 1)
+                logger.warning(f"Rolled back nonce: account={account_index}, api_key={api_key_index}, {old_nonce} → {self.nonces[account_index][api_key_index]}")
 
     async def get_current_nonce(self, account_index: int, api_key_index: int) -> int:
         """Get current cached nonce without incrementing"""
