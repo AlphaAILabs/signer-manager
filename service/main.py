@@ -1,5 +1,6 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from typing import Optional, Dict
 import ctypes
@@ -11,26 +12,56 @@ import asyncio
 from collections import defaultdict
 from eth_account import Account
 from eth_account.messages import encode_defunct
+from starlette.middleware.base import BaseHTTPMiddleware
 
 # Import nonce manager
 from service.nonce_manager import nonce_manager
 
 logging.basicConfig(level=logging.DEBUG)
 
-app = FastAPI(title="Lighter Signing Service (Thread-Safe with Global Lock)", version="3.0.0")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+app = FastAPI(
+    title="Lighter Signing Service (Thread-Safe with Global Lock)",
+    version="3.0.0",
+    docs_url="/docs",
+    redoc_url="/redoc"
 )
+
+
+# Custom CORS middleware to ensure headers are added
+class CustomCORSMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        # Handle preflight requests
+        if request.method == "OPTIONS":
+            response = Response()
+            response.status_code = 200
+            response.headers["Access-Control-Allow-Origin"] = "*"
+            response.headers["Access-Control-Allow-Methods"] = "*"
+            response.headers["Access-Control-Allow-Headers"] = "*"
+            response.headers["Access-Control-Max-Age"] = "3600"
+            return response
+
+        # Process regular requests
+        response = await call_next(request)
+
+        # Add CORS headers to response
+        response.headers["Access-Control-Allow-Origin"] = "*"
+        response.headers["Access-Control-Allow-Methods"] = "*"
+        response.headers["Access-Control-Allow-Headers"] = "*"
+
+        return response
+
+
+# Add custom CORS middleware
+app.add_middleware(CustomCORSMiddleware)
 
 
 @app.on_event("startup")
 async def startup_event():
     """Check if signer is initialized on startup"""
+    logging.info("=" * 60)
+    logging.info("Service starting up...")
+    logging.info(f"CORS middleware enabled: allow_origins=['*'], allow_methods=['*']")
+    logging.info("=" * 60)
     if signer is None:
         logging.error("=" * 60)
         logging.error("CRITICAL: Signer failed to initialize!")
@@ -257,6 +288,17 @@ async def _switch_api_key_internal(api_key_index: int):
     if result:
         error_msg = result.decode("utf-8")
         raise HTTPException(status_code=400, detail=f"Failed to switch API key: {error_msg}")
+
+
+@app.get("/health")
+async def health_check():
+    """Simple health check endpoint to test CORS"""
+    return {
+        "status": "ok",
+        "service": "Lighter Signing Service",
+        "version": "3.0.0",
+        "signer_initialized": signer is not None
+    }
 
 
 @app.post("/create_client")

@@ -109,6 +109,7 @@ a = Analysis(
         'starlette',
         'starlette.routing',
         'starlette.middleware',
+        'starlette.middleware.base',
         'starlette.middleware.cors',
         'starlette.responses',
         'starlette.requests',

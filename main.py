@@ -508,7 +508,7 @@ class LighterSigningServiceGUI(ctk.CTk):
 
         self.copy_localhost_btn = ctk.CTkButton(
             chrome_container,
-            text="📋",
+            text="复制",
             command=lambda: self.copy_address(f"http://localhost:{self.service_port}"),
             font=ctk.CTkFont(size=10),
             width=45,
@@ -543,7 +543,7 @@ class LighterSigningServiceGUI(ctk.CTk):
 
         self.copy_lan_btn = ctk.CTkButton(
             fingerprint_container,
-            text="📋",
+            text="复制",
             command=lambda: self.copy_address(lan_address),
             font=ctk.CTkFont(size=10),
             width=45,
@@ -960,15 +960,16 @@ class LighterSigningServiceGUI(ctk.CTk):
             # Signal the server to stop
             if self.uvicorn_server:
                 self.uvicorn_server.should_exit = True
+                self.uvicorn_server.force_exit = True
 
-                # Wait for server to gracefully shutdown
-                max_wait = 5  # seconds
+                # Wait for server to gracefully shutdown (reduced timeout)
+                max_wait = 1.0  # seconds (reduced from 5)
                 waited = 0
                 while waited < max_wait:
                     if not is_port_in_use(self.service_port):
                         break
-                    time.sleep(0.5)
-                    waited += 0.5
+                    time.sleep(0.1)  # Check more frequently (reduced from 0.5)
+                    waited += 0.1
 
             self.service_running = False
             self.service_process = None
@@ -1009,14 +1010,12 @@ class LighterSigningServiceGUI(ctk.CTk):
         if self.service_running:
             self.log("Stopping service before exit...", "INFO")
             self.stop_service()
-            # Give more time for graceful shutdown
-            time.sleep(2)
 
             # Force kill if still running (Windows only)
             if sys.platform == 'win32' and is_port_in_use(self.service_port):
                 self.log("Force terminating service...", "WARNING")
                 kill_process_on_port(self.service_port)
-                time.sleep(1)
+                time.sleep(0.5)
 
         self.destroy()
 
@@ -1034,11 +1033,89 @@ class LighterSigningServiceGUI(ctk.CTk):
             self.log("Switched to dark theme", "INFO")
 
 
+def check_single_instance():
+    """
+    Check if another instance is already running
+    Returns True if this is the only instance, False otherwise
+    """
+    import tempfile
+    lock_file = Path(tempfile.gettempdir()) / "alphalabs_signer.lock"
+
+    try:
+        # Try to create lock file with exclusive access
+        if lock_file.exists():
+            # Check if the lock file is stale (process died without cleanup)
+            try:
+                with open(lock_file, 'r') as f:
+                    old_pid = int(f.read().strip())
+
+                # Check if process with that PID is still running
+                import psutil
+                if psutil.pid_exists(old_pid):
+                    try:
+                        proc = psutil.Process(old_pid)
+                        # Check if it's actually our app
+                        if 'AlphaLabsSigner' in proc.name() or 'python' in proc.name().lower():
+                            print(f"Another instance is already running (PID: {old_pid})")
+                            return False
+                    except (psutil.NoSuchProcess, psutil.AccessDenied):
+                        pass
+
+                # Stale lock file, remove it
+                lock_file.unlink()
+            except (ValueError, FileNotFoundError):
+                # Invalid lock file, remove it
+                if lock_file.exists():
+                    lock_file.unlink()
+
+        # Create lock file with current PID
+        with open(lock_file, 'w') as f:
+            f.write(str(os.getpid()))
+
+        return True
+    except Exception as e:
+        print(f"Error checking single instance: {e}")
+        return True  # Allow app to start on error
+
+
+def cleanup_lock_file():
+    """Remove lock file on exit"""
+    import tempfile
+    lock_file = Path(tempfile.gettempdir()) / "alphalabs_signer.lock"
+    try:
+        if lock_file.exists():
+            lock_file.unlink()
+    except Exception:
+        pass
+
+
 def main():
     """Main entry point"""
-    app = LighterSigningServiceGUI()
-    app.protocol("WM_DELETE_WINDOW", app.on_closing)
-    app.mainloop()
+    # Check if another instance is already running
+    if not check_single_instance():
+        import tkinter.messagebox as messagebox
+        try:
+            root = ctk.CTk()
+            root.withdraw()  # Hide root window
+            messagebox.showwarning(
+                "AlphaLabs Signer",
+                "应用已经在运行中！\n\nAnother instance is already running!"
+            )
+            root.destroy()
+        except Exception:
+            print("Another instance is already running!")
+        return
+
+    # Register cleanup on exit
+    import atexit
+    atexit.register(cleanup_lock_file)
+
+    try:
+        app = LighterSigningServiceGUI()
+        app.protocol("WM_DELETE_WINDOW", app.on_closing)
+        app.mainloop()
+    finally:
+        cleanup_lock_file()
 
 
 if __name__ == "__main__":
