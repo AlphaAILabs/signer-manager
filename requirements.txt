@@ -6,5 +6,5 @@ pyinstaller
 fastapi==0.104.1
 uvicorn==0.24.0
 pydantic>=2.8.0
-eth-account==0.10.0
+eth-account==0.13.7
 requests==2.31.0
