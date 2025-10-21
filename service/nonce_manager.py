@@ -6,7 +6,6 @@ Manages nonce state to prevent signature conflicts
 import asyncio
 import logging
 from typing import Dict, Tuple, Optional
-import aiohttp
 
 logger = logging.getLogger(__name__)
 
