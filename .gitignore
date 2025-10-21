@@ -48,3 +48,5 @@ dmg_temp/
 *-Setup.exe
 installer.iss
 
+tests/
+lighter/

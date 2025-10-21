@@ -12,6 +12,9 @@ from collections import defaultdict
 from eth_account import Account
 from eth_account.messages import encode_defunct
 
+# Import nonce manager
+from service.nonce_manager import nonce_manager
+
 logging.basicConfig(level=logging.DEBUG)
 
 app = FastAPI(title="Lighter Signing Service (Thread-Safe with Global Lock)", version="3.0.0")
@@ -67,7 +70,8 @@ def _initialize_signer():
         return ctypes.CDLL(os.path.join(path_to_signer_folders, "signer-amd64.dll"))
     else:
         raise Exception(
-            f"Unsupported platform/architecture: {platform.system()}/{platform.machine()}"
+            f"Unsupported platform/architecture: {platform.system()}/{platform.machine()}. "
+            "Currently supported: Linux(x86_64), macOS(arm64), and Windows(x86_64)."
         )
 
 
@@ -108,7 +112,7 @@ class SignChangeApiKeyRequest(BaseModel):
     account_index: int
     eth_private_key: str
     new_pubkey: str
-    nonce: int
+    nonce: int = -1
 
 
 class SignCreateOrderRequest(BaseModel):
@@ -307,6 +311,16 @@ async def create_client(request: CreateClientRequest):
                 "account_index": request.account_index
             }
 
+            # Initialize nonce for this account/api_key
+            try:
+                await nonce_manager.initialize_account(
+                    account_index=request.account_index,
+                    api_key_index=request.api_key_index,
+                    api_url=request.url
+                )
+            except Exception as e:
+                logger.warning(f"Could not initialize nonce from API: {e}, will use auto-increment from 0")
+
         return {"message": "Client created successfully", "client_key": client_key}
     except HTTPException:
         raise
@@ -392,485 +406,959 @@ async def create_api_key(request: CreateApiKeyRequest):
 @app.post("/sign_change_api_key")
 async def sign_change_api_key(request: SignChangeApiKeyRequest):
     """
-    Sign a change API key transaction. Thread-safe with global locking.
-    The lock ensures that switch_api_key and signing happen atomically.
+    Sign a change API key transaction with per-account locking to prevent nonce conflicts.
+    Uses account-specific locks to serialize requests for the same (account_index, api_key_index).
     """
     try:
-        # Acquire global lock to ensure atomic switch + sign
-        async with global_signer_lock:
-            await _switch_api_key_internal(request.api_key_index)
+        if not signer:
+            raise HTTPException(status_code=500, detail="Signer not initialized")
 
-            signer.SignChangePubKey.argtypes = [
-                ctypes.c_char_p,
-                ctypes.c_longlong,
-            ]
-            signer.SignChangePubKey.restype = StrOrErr
-            result = signer.SignChangePubKey(ctypes.c_char_p(request.new_pubkey.encode("utf-8")), request.nonce)
+        # Get API URL from client config for nonce initialization
+        client_key = get_client_key(request.api_key_index, request.account_index)
+        client_config = clients.get(client_key)
+        api_url = client_config.get("url") if client_config else None
 
-            tx_info_str = result.str.decode("utf-8") if result.str else None
-            error = result.err.decode("utf-8") if result.err else None
-            if error:
-                raise HTTPException(status_code=400, detail=error)
+        # Get account-specific lock to prevent nonce race conditions
+        account_lock = nonce_manager.get_account_lock(request.account_index, request.api_key_index)
 
-            tx_info = json.loads(tx_info_str)
-            msg_to_sign = tx_info["MessageToSign"]
-            del tx_info["MessageToSign"]
+        # Hold account lock for the entire nonce get->sign->error handling flow
+        async with account_lock:
+            # Get managed nonce (auto-increment if request.nonce == -1)
+            managed_nonce = await nonce_manager.get_next_nonce(
+                account_index=request.account_index,
+                api_key_index=request.api_key_index,
+                provided_nonce=request.nonce,
+                api_url=api_url
+            )
 
-            acct = Account.from_key(request.eth_private_key)
-            message = encode_defunct(text=msg_to_sign)
-            signature = acct.sign_message(message)
-            tx_info["L1Sig"] = signature.signature.to_0x_hex()
+            # Acquire global lock to ensure atomic switch + sign (protects C library calls)
+            async with global_signer_lock:
+                await _switch_api_key_internal(request.api_key_index)
 
-        return {"tx_info": json.dumps(tx_info)}
+                signer.SignChangePubKey.argtypes = [
+                    ctypes.c_char_p,
+                    ctypes.c_longlong,
+                ]
+                signer.SignChangePubKey.restype = StrOrErr
+                result = signer.SignChangePubKey(ctypes.c_char_p(request.new_pubkey.encode("utf-8")), managed_nonce)
+
+                tx_info_str = result.str.decode("utf-8") if result.str else None
+                error = result.err.decode("utf-8") if result.err else None
+
+                if error:
+                    # Check for nonce-related errors
+                    if "invalid nonce" in error.lower() or "nonce" in error.lower():
+                        logging.warning(f"Nonce error detected in sign_change_api_key: {error}")
+                        await nonce_manager.hard_refresh_nonce(request.account_index, request.api_key_index)
+                    else:
+                        await nonce_manager.acknowledge_failure(request.account_index, request.api_key_index)
+
+                    raise HTTPException(status_code=400, detail=error)
+
+                tx_info = json.loads(tx_info_str)
+                msg_to_sign = tx_info["MessageToSign"]
+                del tx_info["MessageToSign"]
+
+                acct = Account.from_key(request.eth_private_key)
+                message = encode_defunct(text=msg_to_sign)
+                signature = acct.sign_message(message)
+                tx_info["L1Sig"] = signature.signature.to_0x_hex()
+
+            return {"tx_info": json.dumps(tx_info)}
+    except HTTPException:
+        raise
     except Exception as e:
+        logging.error(f"Error in sign_change_api_key: {e}")
+        # Rollback nonce on unexpected error
+        try:
+            await nonce_manager.acknowledge_failure(request.account_index, request.api_key_index)
+        except:
+            pass
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/sign_create_order")
 async def sign_create_order(request: SignCreateOrderRequest):
     """
-    Sign a create order transaction. Thread-safe with global locking.
-    All signing operations are serialized to prevent race conditions.
+    Sign a create order transaction with per-account locking to prevent nonce conflicts.
+    Uses account-specific locks to serialize requests for the same (account_index, api_key_index).
+    Different accounts can process requests concurrently without blocking each other.
     """
     try:
         if not signer:
             raise HTTPException(status_code=500, detail="Signer not initialized")
 
-        logging.debug(f"sign_create_order request: api_key_index={request.api_key_index}, "
-                     f"market_index={request.market_index}, "
-                     f"client_order_index={request.client_order_index}, base_amount={request.base_amount}, "
-                     f"price={request.price}, is_ask={request.is_ask}, "
-                     f"order_type={request.order_type}, time_in_force={request.time_in_force}, "
-                     f"reduce_only={request.reduce_only}, "
-                     f"trigger_price={request.trigger_price}, order_expiry={request.order_expiry}, nonce={request.nonce}")
+        # Get API URL from client config for nonce initialization
+        client_key = get_client_key(request.api_key_index, request.account_index)
+        client_config = clients.get(client_key)
+        api_url = client_config.get("url") if client_config else None
 
-        # Acquire global lock to ensure atomic switch + sign
-        async with global_signer_lock:
-            await _switch_api_key_internal(request.api_key_index)
+        # Get account-specific lock to prevent nonce race conditions
+        # This ensures requests for the same (account_index, api_key_index) are serialized
+        account_lock = nonce_manager.get_account_lock(request.account_index, request.api_key_index)
 
-            signer.SignCreateOrder.argtypes = [
-                ctypes.c_int,
-                ctypes.c_longlong,
-                ctypes.c_longlong,
-                ctypes.c_int,
-                ctypes.c_int,
-                ctypes.c_int,
-                ctypes.c_int,
-                ctypes.c_int,
-                ctypes.c_int,
-                ctypes.c_longlong,
-                ctypes.c_longlong,
-            ]
-            signer.SignCreateOrder.restype = StrOrErr
-
-            result = signer.SignCreateOrder(
-                request.market_index,
-                request.client_order_index,
-                request.base_amount,
-                request.price,
-                request.is_ask,
-                request.order_type,
-                request.time_in_force,
-                request.reduce_only,
-                request.trigger_price,
-                request.order_expiry,
-                request.nonce,
+        # Hold account lock for the entire nonce get->sign->error handling flow
+        async with account_lock:
+            # Get managed nonce (auto-increment if request.nonce == -1)
+            managed_nonce = await nonce_manager.get_next_nonce(
+                account_index=request.account_index,
+                api_key_index=request.api_key_index,
+                provided_nonce=request.nonce,
+                api_url=api_url
             )
 
-            tx_info = result.str.decode("utf-8") if result.str else None
-            error = result.err.decode("utf-8") if result.err else None
+            logging.debug(f"sign_create_order request: api_key_index={request.api_key_index}, "
+                         f"market_index={request.market_index}, "
+                         f"client_order_index={request.client_order_index}, base_amount={request.base_amount}, "
+                         f"price={request.price}, is_ask={request.is_ask}, "
+                         f"order_type={request.order_type}, time_in_force={request.time_in_force}, "
+                         f"reduce_only={request.reduce_only}, "
+                         f"trigger_price={request.trigger_price}, order_expiry={request.order_expiry}, "
+                         f"nonce={request.nonce} → managed_nonce={managed_nonce}")
 
-            if error:
-                raise HTTPException(status_code=400, detail=error)
+            # Acquire global lock to ensure atomic switch + sign (protects C library calls)
+            async with global_signer_lock:
+                await _switch_api_key_internal(request.api_key_index)
 
-        return {"tx_info": tx_info}
+                signer.SignCreateOrder.argtypes = [
+                    ctypes.c_int,
+                    ctypes.c_longlong,
+                    ctypes.c_longlong,
+                    ctypes.c_int,
+                    ctypes.c_int,
+                    ctypes.c_int,
+                    ctypes.c_int,
+                    ctypes.c_int,
+                    ctypes.c_int,
+                    ctypes.c_longlong,
+                    ctypes.c_longlong,
+                ]
+                signer.SignCreateOrder.restype = StrOrErr
+
+                result = signer.SignCreateOrder(
+                    request.market_index,
+                    request.client_order_index,
+                    request.base_amount,
+                    request.price,
+                    int(request.is_ask),
+                    request.order_type,
+                    request.time_in_force,
+                    request.reduce_only,
+                    request.trigger_price,
+                    request.order_expiry,
+                    managed_nonce,  # Use managed nonce
+                )
+
+                tx_info = result.str.decode("utf-8") if result.str else None
+                error = result.err.decode("utf-8") if result.err else None
+
+                if error:
+                    # Check for nonce-related errors
+                    if "invalid nonce" in error.lower() or "nonce" in error.lower():
+                        logging.warning(f"Nonce error detected: {error}")
+                        # Hard refresh nonce from API
+                        await nonce_manager.hard_refresh_nonce(request.account_index, request.api_key_index)
+                    else:
+                        # Other errors: rollback nonce
+                        await nonce_manager.acknowledge_failure(request.account_index, request.api_key_index)
+
+                    raise HTTPException(status_code=400, detail=error)
+
+            # Success - nonce manager already incremented
+            return {"tx_info": tx_info}
     except HTTPException:
         raise
     except Exception as e:
         logging.error(f"Error in sign_create_order: {e}")
+        # Rollback nonce on unexpected error
+        try:
+            await nonce_manager.acknowledge_failure(request.account_index, request.api_key_index)
+        except:
+            pass
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/sign_cancel_order")
 async def sign_cancel_order(request: SignCancelOrderRequest):
     """
-    Sign a cancel order transaction. Thread-safe with global locking.
+    Sign a cancel order transaction with per-account locking to prevent nonce conflicts.
+    Uses account-specific locks to serialize requests for the same (account_index, api_key_index).
     """
     try:
         if not signer:
             raise HTTPException(status_code=500, detail="Signer not initialized")
 
-        # Acquire global lock to ensure atomic switch + sign
-        async with global_signer_lock:
-            await _switch_api_key_internal(request.api_key_index)
+        # Get API URL from client config for nonce initialization
+        client_key = get_client_key(request.api_key_index, request.account_index)
+        client_config = clients.get(client_key)
+        api_url = client_config.get("url") if client_config else None
 
-            signer.SignCancelOrder.argtypes = [
-                ctypes.c_int,
-                ctypes.c_longlong,
-                ctypes.c_longlong,
-            ]
-            signer.SignCancelOrder.restype = StrOrErr
+        # Get account-specific lock to prevent nonce race conditions
+        account_lock = nonce_manager.get_account_lock(request.account_index, request.api_key_index)
 
-            result = signer.SignCancelOrder(request.market_index, request.order_index, request.nonce)
+        # Hold account lock for the entire nonce get->sign->error handling flow
+        async with account_lock:
+            # Get managed nonce (auto-increment if request.nonce == -1)
+            managed_nonce = await nonce_manager.get_next_nonce(
+                account_index=request.account_index,
+                api_key_index=request.api_key_index,
+                provided_nonce=request.nonce,
+                api_url=api_url
+            )
 
-            tx_info = result.str.decode("utf-8") if result.str else None
-            error = result.err.decode("utf-8") if result.err else None
+            # Acquire global lock to ensure atomic switch + sign (protects C library calls)
+            async with global_signer_lock:
+                await _switch_api_key_internal(request.api_key_index)
 
-            if error:
-                raise HTTPException(status_code=400, detail=error)
+                signer.SignCancelOrder.argtypes = [
+                    ctypes.c_int,
+                    ctypes.c_longlong,
+                    ctypes.c_longlong,
+                ]
+                signer.SignCancelOrder.restype = StrOrErr
 
-        return {"tx_info": tx_info}
+                result = signer.SignCancelOrder(request.market_index, request.order_index, managed_nonce)
+
+                tx_info = result.str.decode("utf-8") if result.str else None
+                error = result.err.decode("utf-8") if result.err else None
+
+                if error:
+                    # Check for nonce-related errors
+                    if "invalid nonce" in error.lower() or "nonce" in error.lower():
+                        logging.warning(f"Nonce error detected in sign_cancel_order: {error}")
+                        await nonce_manager.hard_refresh_nonce(request.account_index, request.api_key_index)
+                    else:
+                        await nonce_manager.acknowledge_failure(request.account_index, request.api_key_index)
+
+                    raise HTTPException(status_code=400, detail=error)
+
+            return {"tx_info": tx_info}
     except HTTPException:
         raise
     except Exception as e:
         logging.error(f"Error in sign_cancel_order: {e}")
+        # Rollback nonce on unexpected error
+        try:
+            await nonce_manager.acknowledge_failure(request.account_index, request.api_key_index)
+        except:
+            pass
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/sign_withdraw")
 async def sign_withdraw(request: SignWithdrawRequest):
     """
-    Sign a withdraw transaction. Thread-safe with global locking.
+    Sign a withdraw transaction with per-account locking to prevent nonce conflicts.
+    Uses account-specific locks to serialize requests for the same (account_index, api_key_index).
     """
     try:
-        # Acquire global lock to ensure atomic switch + sign
-        async with global_signer_lock:
-            await _switch_api_key_internal(request.api_key_index)
+        if not signer:
+            raise HTTPException(status_code=500, detail="Signer not initialized")
 
-            signer.SignWithdraw.argtypes = [ctypes.c_longlong, ctypes.c_longlong]
-            signer.SignWithdraw.restype = StrOrErr
+        # Get API URL from client config for nonce initialization
+        client_key = get_client_key(request.api_key_index, request.account_index)
+        client_config = clients.get(client_key)
+        api_url = client_config.get("url") if client_config else None
 
-            result = signer.SignWithdraw(request.usdc_amount, request.nonce)
+        # Get account-specific lock to prevent nonce race conditions
+        account_lock = nonce_manager.get_account_lock(request.account_index, request.api_key_index)
 
-            tx_info = result.str.decode("utf-8") if result.str else None
-            error = result.err.decode("utf-8") if result.err else None
+        # Hold account lock for the entire nonce get->sign->error handling flow
+        async with account_lock:
+            # Get managed nonce (auto-increment if request.nonce == -1)
+            managed_nonce = await nonce_manager.get_next_nonce(
+                account_index=request.account_index,
+                api_key_index=request.api_key_index,
+                provided_nonce=request.nonce,
+                api_url=api_url
+            )
 
-            if error:
-                raise HTTPException(status_code=400, detail=error)
+            # Acquire global lock to ensure atomic switch + sign (protects C library calls)
+            async with global_signer_lock:
+                await _switch_api_key_internal(request.api_key_index)
 
-        return {"tx_info": tx_info}
+                signer.SignWithdraw.argtypes = [ctypes.c_longlong, ctypes.c_longlong]
+                signer.SignWithdraw.restype = StrOrErr
+
+                result = signer.SignWithdraw(request.usdc_amount, managed_nonce)
+
+                tx_info = result.str.decode("utf-8") if result.str else None
+                error = result.err.decode("utf-8") if result.err else None
+
+                if error:
+                    # Check for nonce-related errors
+                    if "invalid nonce" in error.lower() or "nonce" in error.lower():
+                        logging.warning(f"Nonce error detected in sign_withdraw: {error}")
+                        await nonce_manager.hard_refresh_nonce(request.account_index, request.api_key_index)
+                    else:
+                        await nonce_manager.acknowledge_failure(request.account_index, request.api_key_index)
+
+                    raise HTTPException(status_code=400, detail=error)
+
+            return {"tx_info": tx_info}
+    except HTTPException:
+        raise
     except Exception as e:
+        logging.error(f"Error in sign_withdraw: {e}")
+        # Rollback nonce on unexpected error
+        try:
+            await nonce_manager.acknowledge_failure(request.account_index, request.api_key_index)
+        except:
+            pass
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/sign_create_sub_account")
 async def sign_create_sub_account(request: SignCreateSubAccountRequest):
     """
-    Sign a create sub-account transaction. Thread-safe with global locking.
+    Sign a create sub-account transaction with per-account locking to prevent nonce conflicts.
+    Uses account-specific locks to serialize requests for the same (account_index, api_key_index).
     """
     try:
-        # Acquire global lock to ensure atomic switch + sign
-        async with global_signer_lock:
-            await _switch_api_key_internal(request.api_key_index)
+        if not signer:
+            raise HTTPException(status_code=500, detail="Signer not initialized")
 
-            signer.SignCreateSubAccount.argtypes = [ctypes.c_longlong]
-            signer.SignCreateSubAccount.restype = StrOrErr
+        # Get API URL from client config for nonce initialization
+        client_key = get_client_key(request.api_key_index, request.account_index)
+        client_config = clients.get(client_key)
+        api_url = client_config.get("url") if client_config else None
 
-            result = signer.SignCreateSubAccount(request.nonce)
+        # Get account-specific lock to prevent nonce race conditions
+        account_lock = nonce_manager.get_account_lock(request.account_index, request.api_key_index)
 
-            tx_info = result.str.decode("utf-8") if result.str else None
-            error = result.err.decode("utf-8") if result.err else None
+        # Hold account lock for the entire nonce get->sign->error handling flow
+        async with account_lock:
+            # Get managed nonce (auto-increment if request.nonce == -1)
+            managed_nonce = await nonce_manager.get_next_nonce(
+                account_index=request.account_index,
+                api_key_index=request.api_key_index,
+                provided_nonce=request.nonce,
+                api_url=api_url
+            )
 
-            if error:
-                raise HTTPException(status_code=400, detail=error)
+            # Acquire global lock to ensure atomic switch + sign (protects C library calls)
+            async with global_signer_lock:
+                await _switch_api_key_internal(request.api_key_index)
 
-        return {"tx_info": tx_info}
+                signer.SignCreateSubAccount.argtypes = [ctypes.c_longlong]
+                signer.SignCreateSubAccount.restype = StrOrErr
+
+                result = signer.SignCreateSubAccount(managed_nonce)
+
+                tx_info = result.str.decode("utf-8") if result.str else None
+                error = result.err.decode("utf-8") if result.err else None
+
+                if error:
+                    # Check for nonce-related errors
+                    if "invalid nonce" in error.lower() or "nonce" in error.lower():
+                        logging.warning(f"Nonce error detected in sign_create_sub_account: {error}")
+                        await nonce_manager.hard_refresh_nonce(request.account_index, request.api_key_index)
+                    else:
+                        await nonce_manager.acknowledge_failure(request.account_index, request.api_key_index)
+
+                    raise HTTPException(status_code=400, detail=error)
+
+            return {"tx_info": tx_info}
+    except HTTPException:
+        raise
     except Exception as e:
+        logging.error(f"Error in sign_create_sub_account: {e}")
+        # Rollback nonce on unexpected error
+        try:
+            await nonce_manager.acknowledge_failure(request.account_index, request.api_key_index)
+        except:
+            pass
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/sign_cancel_all_orders")
 async def sign_cancel_all_orders(request: SignCancelAllOrdersRequest):
     """
-    Sign a cancel all orders transaction. Thread-safe with global locking.
+    Sign a cancel all orders transaction with per-account locking to prevent nonce conflicts.
+    Uses account-specific locks to serialize requests for the same (account_index, api_key_index).
     """
     try:
-        # Acquire global lock to ensure atomic switch + sign
-        async with global_signer_lock:
-            await _switch_api_key_internal(request.api_key_index)
+        if not signer:
+            raise HTTPException(status_code=500, detail="Signer not initialized")
 
-            signer.SignCancelAllOrders.argtypes = [
-                ctypes.c_int,
-                ctypes.c_longlong,
-                ctypes.c_longlong,
-            ]
-            signer.SignCancelAllOrders.restype = StrOrErr
+        # Get API URL from client config for nonce initialization
+        client_key = get_client_key(request.api_key_index, request.account_index)
+        client_config = clients.get(client_key)
+        api_url = client_config.get("url") if client_config else None
 
-            result = signer.SignCancelAllOrders(request.time_in_force, request.time, request.nonce)
+        # Get account-specific lock to prevent nonce race conditions
+        account_lock = nonce_manager.get_account_lock(request.account_index, request.api_key_index)
 
-            tx_info = result.str.decode("utf-8") if result.str else None
-            error = result.err.decode("utf-8") if result.err else None
+        # Hold account lock for the entire nonce get->sign->error handling flow
+        async with account_lock:
+            # Get managed nonce (auto-increment if request.nonce == -1)
+            managed_nonce = await nonce_manager.get_next_nonce(
+                account_index=request.account_index,
+                api_key_index=request.api_key_index,
+                provided_nonce=request.nonce,
+                api_url=api_url
+            )
 
-            if error:
-                raise HTTPException(status_code=400, detail=error)
+            # Acquire global lock to ensure atomic switch + sign (protects C library calls)
+            async with global_signer_lock:
+                await _switch_api_key_internal(request.api_key_index)
 
-        return {"tx_info": tx_info}
+                signer.SignCancelAllOrders.argtypes = [
+                    ctypes.c_int,
+                    ctypes.c_longlong,
+                    ctypes.c_longlong,
+                ]
+                signer.SignCancelAllOrders.restype = StrOrErr
+
+                result = signer.SignCancelAllOrders(request.time_in_force, request.time, managed_nonce)
+
+                tx_info = result.str.decode("utf-8") if result.str else None
+                error = result.err.decode("utf-8") if result.err else None
+
+                if error:
+                    # Check for nonce-related errors
+                    if "invalid nonce" in error.lower() or "nonce" in error.lower():
+                        logging.warning(f"Nonce error detected in sign_cancel_all_orders: {error}")
+                        await nonce_manager.hard_refresh_nonce(request.account_index, request.api_key_index)
+                    else:
+                        await nonce_manager.acknowledge_failure(request.account_index, request.api_key_index)
+
+                    raise HTTPException(status_code=400, detail=error)
+
+            return {"tx_info": tx_info}
+    except HTTPException:
+        raise
     except Exception as e:
+        logging.error(f"Error in sign_cancel_all_orders: {e}")
+        # Rollback nonce on unexpected error
+        try:
+            await nonce_manager.acknowledge_failure(request.account_index, request.api_key_index)
+        except:
+            pass
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/sign_modify_order")
 async def sign_modify_order(request: SignModifyOrderRequest):
     """
-    Sign a modify order transaction. Thread-safe with global locking.
+    Sign a modify order transaction with per-account locking to prevent nonce conflicts.
+    Uses account-specific locks to serialize requests for the same (account_index, api_key_index).
     """
     try:
-        # Acquire global lock to ensure atomic switch + sign
-        async with global_signer_lock:
-            await _switch_api_key_internal(request.api_key_index)
+        if not signer:
+            raise HTTPException(status_code=500, detail="Signer not initialized")
 
-            signer.SignModifyOrder.argtypes = [
-                ctypes.c_int,
-                ctypes.c_longlong,
-                ctypes.c_longlong,
-                ctypes.c_longlong,
-                ctypes.c_longlong,
-                ctypes.c_longlong,
-            ]
-            signer.SignModifyOrder.restype = StrOrErr
+        # Get API URL from client config for nonce initialization
+        client_key = get_client_key(request.api_key_index, request.account_index)
+        client_config = clients.get(client_key)
+        api_url = client_config.get("url") if client_config else None
 
-            result = signer.SignModifyOrder(
-                request.market_index,
-                request.order_index,
-                request.base_amount,
-                request.price,
-                request.trigger_price,
-                request.nonce
+        # Get account-specific lock to prevent nonce race conditions
+        account_lock = nonce_manager.get_account_lock(request.account_index, request.api_key_index)
+
+        # Hold account lock for the entire nonce get->sign->error handling flow
+        async with account_lock:
+            # Get managed nonce (auto-increment if request.nonce == -1)
+            managed_nonce = await nonce_manager.get_next_nonce(
+                account_index=request.account_index,
+                api_key_index=request.api_key_index,
+                provided_nonce=request.nonce,
+                api_url=api_url
             )
 
-            tx_info = result.str.decode("utf-8") if result.str else None
-            error = result.err.decode("utf-8") if result.err else None
+            # Acquire global lock to ensure atomic switch + sign (protects C library calls)
+            async with global_signer_lock:
+                await _switch_api_key_internal(request.api_key_index)
 
-            if error:
-                raise HTTPException(status_code=400, detail=error)
+                signer.SignModifyOrder.argtypes = [
+                    ctypes.c_int,
+                    ctypes.c_longlong,
+                    ctypes.c_longlong,
+                    ctypes.c_longlong,
+                    ctypes.c_longlong,
+                    ctypes.c_longlong,
+                ]
+                signer.SignModifyOrder.restype = StrOrErr
 
-        return {"tx_info": tx_info}
+                result = signer.SignModifyOrder(
+                    request.market_index,
+                    request.order_index,
+                    request.base_amount,
+                    request.price,
+                    request.trigger_price,
+                    managed_nonce
+                )
+
+                tx_info = result.str.decode("utf-8") if result.str else None
+                error = result.err.decode("utf-8") if result.err else None
+
+                if error:
+                    # Check for nonce-related errors
+                    if "invalid nonce" in error.lower() or "nonce" in error.lower():
+                        logging.warning(f"Nonce error detected in sign_modify_order: {error}")
+                        await nonce_manager.hard_refresh_nonce(request.account_index, request.api_key_index)
+                    else:
+                        await nonce_manager.acknowledge_failure(request.account_index, request.api_key_index)
+
+                    raise HTTPException(status_code=400, detail=error)
+
+            return {"tx_info": tx_info}
+    except HTTPException:
+        raise
     except Exception as e:
+        logging.error(f"Error in sign_modify_order: {e}")
+        # Rollback nonce on unexpected error
+        try:
+            await nonce_manager.acknowledge_failure(request.account_index, request.api_key_index)
+        except:
+            pass
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/sign_transfer")
 async def sign_transfer(request: SignTransferRequest):
     """
-    Sign a transfer transaction. Thread-safe with global locking.
+    Sign a transfer transaction with per-account locking to prevent nonce conflicts.
+    Uses account-specific locks to serialize requests for the same (account_index, api_key_index).
     """
     try:
-        # Acquire global lock to ensure atomic switch + sign
-        async with global_signer_lock:
-            await _switch_api_key_internal(request.api_key_index)
+        if not signer:
+            raise HTTPException(status_code=500, detail="Signer not initialized")
 
-            signer.SignTransfer.argtypes = [
-                ctypes.c_longlong,
-                ctypes.c_longlong,
-                ctypes.c_longlong,
-                ctypes.c_char_p,
-                ctypes.c_longlong,
-            ]
-            signer.SignTransfer.restype = StrOrErr
+        # Get API URL from client config for nonce initialization
+        client_key = get_client_key(request.api_key_index, request.account_index)
+        client_config = clients.get(client_key)
+        api_url = client_config.get("url") if client_config else None
 
-            result = signer.SignTransfer(
-                request.to_account_index,
-                request.usdc_amount,
-                request.fee,
-                ctypes.c_char_p(request.memo.encode("utf-8")),
-                request.nonce
+        # Get account-specific lock to prevent nonce race conditions
+        account_lock = nonce_manager.get_account_lock(request.account_index, request.api_key_index)
+
+        # Hold account lock for the entire nonce get->sign->error handling flow
+        async with account_lock:
+            # Get managed nonce (auto-increment if request.nonce == -1)
+            managed_nonce = await nonce_manager.get_next_nonce(
+                account_index=request.account_index,
+                api_key_index=request.api_key_index,
+                provided_nonce=request.nonce,
+                api_url=api_url
             )
 
-            tx_info_str = result.str.decode("utf-8") if result.str else None
-            error = result.err.decode("utf-8") if result.err else None
+            # Acquire global lock to ensure atomic switch + sign (protects C library calls)
+            async with global_signer_lock:
+                await _switch_api_key_internal(request.api_key_index)
 
-            if error:
-                raise HTTPException(status_code=400, detail=error)
+                signer.SignTransfer.argtypes = [
+                    ctypes.c_longlong,
+                    ctypes.c_longlong,
+                    ctypes.c_longlong,
+                    ctypes.c_char_p,
+                    ctypes.c_longlong,
+                ]
+                signer.SignTransfer.restype = StrOrErr
 
-            tx_info = json.loads(tx_info_str)
-            msg_to_sign = tx_info["MessageToSign"]
-            del tx_info["MessageToSign"]
+                result = signer.SignTransfer(
+                    request.to_account_index,
+                    request.usdc_amount,
+                    request.fee,
+                    ctypes.c_char_p(request.memo.encode("utf-8")),
+                    managed_nonce
+                )
 
-            acct = Account.from_key(request.eth_private_key)
-            message = encode_defunct(text=msg_to_sign)
-            signature = acct.sign_message(message)
-            tx_info["L1Sig"] = signature.signature.to_0x_hex()
+                tx_info_str = result.str.decode("utf-8") if result.str else None
+                error = result.err.decode("utf-8") if result.err else None
 
-        return {"tx_info": json.dumps(tx_info)}
+                if error:
+                    # Check for nonce-related errors
+                    if "invalid nonce" in error.lower() or "nonce" in error.lower():
+                        logging.warning(f"Nonce error detected in sign_transfer: {error}")
+                        await nonce_manager.hard_refresh_nonce(request.account_index, request.api_key_index)
+                    else:
+                        await nonce_manager.acknowledge_failure(request.account_index, request.api_key_index)
+
+                    raise HTTPException(status_code=400, detail=error)
+
+                tx_info = json.loads(tx_info_str)
+                msg_to_sign = tx_info["MessageToSign"]
+                del tx_info["MessageToSign"]
+
+                acct = Account.from_key(request.eth_private_key)
+                message = encode_defunct(text=msg_to_sign)
+                signature = acct.sign_message(message)
+                tx_info["L1Sig"] = signature.signature.to_0x_hex()
+
+            return {"tx_info": json.dumps(tx_info)}
+    except HTTPException:
+        raise
     except Exception as e:
+        logging.error(f"Error in sign_transfer: {e}")
+        # Rollback nonce on unexpected error
+        try:
+            await nonce_manager.acknowledge_failure(request.account_index, request.api_key_index)
+        except:
+            pass
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/sign_create_public_pool")
 async def sign_create_public_pool(request: SignCreatePublicPoolRequest):
     """
-    Sign a create public pool transaction. Thread-safe with global locking.
+    Sign a create public pool transaction with per-account locking to prevent nonce conflicts.
+    Uses account-specific locks to serialize requests for the same (account_index, api_key_index).
     """
     try:
-        # Acquire global lock to ensure atomic switch + sign
-        async with global_signer_lock:
-            await _switch_api_key_internal(request.api_key_index)
+        if not signer:
+            raise HTTPException(status_code=500, detail="Signer not initialized")
 
-            signer.SignCreatePublicPool.argtypes = [
-                ctypes.c_longlong,
-                ctypes.c_longlong,
-                ctypes.c_longlong,
-                ctypes.c_longlong,
-            ]
-            signer.SignCreatePublicPool.restype = StrOrErr
+        # Get API URL from client config for nonce initialization
+        client_key = get_client_key(request.api_key_index, request.account_index)
+        client_config = clients.get(client_key)
+        api_url = client_config.get("url") if client_config else None
 
-            result = signer.SignCreatePublicPool(
-                request.operator_fee,
-                request.initial_total_shares,
-                request.min_operator_share_rate,
-                request.nonce
+        # Get account-specific lock to prevent nonce race conditions
+        account_lock = nonce_manager.get_account_lock(request.account_index, request.api_key_index)
+
+        # Hold account lock for the entire nonce get->sign->error handling flow
+        async with account_lock:
+            # Get managed nonce (auto-increment if request.nonce == -1)
+            managed_nonce = await nonce_manager.get_next_nonce(
+                account_index=request.account_index,
+                api_key_index=request.api_key_index,
+                provided_nonce=request.nonce,
+                api_url=api_url
             )
 
-            tx_info = result.str.decode("utf-8") if result.str else None
-            error = result.err.decode("utf-8") if result.err else None
+            # Acquire global lock to ensure atomic switch + sign (protects C library calls)
+            async with global_signer_lock:
+                await _switch_api_key_internal(request.api_key_index)
 
-            if error:
-                raise HTTPException(status_code=400, detail=error)
+                signer.SignCreatePublicPool.argtypes = [
+                    ctypes.c_longlong,
+                    ctypes.c_longlong,
+                    ctypes.c_longlong,
+                    ctypes.c_longlong,
+                ]
+                signer.SignCreatePublicPool.restype = StrOrErr
 
-        return {"tx_info": tx_info}
+                result = signer.SignCreatePublicPool(
+                    request.operator_fee,
+                    request.initial_total_shares,
+                    request.min_operator_share_rate,
+                    managed_nonce
+                )
+
+                tx_info = result.str.decode("utf-8") if result.str else None
+                error = result.err.decode("utf-8") if result.err else None
+
+                if error:
+                    # Check for nonce-related errors
+                    if "invalid nonce" in error.lower() or "nonce" in error.lower():
+                        logging.warning(f"Nonce error detected in sign_create_public_pool: {error}")
+                        await nonce_manager.hard_refresh_nonce(request.account_index, request.api_key_index)
+                    else:
+                        await nonce_manager.acknowledge_failure(request.account_index, request.api_key_index)
+
+                    raise HTTPException(status_code=400, detail=error)
+
+            return {"tx_info": tx_info}
+    except HTTPException:
+        raise
     except Exception as e:
+        logging.error(f"Error in sign_create_public_pool: {e}")
+        # Rollback nonce on unexpected error
+        try:
+            await nonce_manager.acknowledge_failure(request.account_index, request.api_key_index)
+        except:
+            pass
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/sign_update_public_pool")
 async def sign_update_public_pool(request: SignUpdatePublicPoolRequest):
     """
-    Sign an update public pool transaction. Thread-safe with global locking.
+    Sign an update public pool transaction with per-account locking to prevent nonce conflicts.
+    Uses account-specific locks to serialize requests for the same (account_index, api_key_index).
     """
     try:
-        # Acquire global lock to ensure atomic switch + sign
-        async with global_signer_lock:
-            await _switch_api_key_internal(request.api_key_index)
+        if not signer:
+            raise HTTPException(status_code=500, detail="Signer not initialized")
 
-            signer.SignUpdatePublicPool.argtypes = [
-                ctypes.c_longlong,
-                ctypes.c_int,
-                ctypes.c_longlong,
-                ctypes.c_longlong,
-                ctypes.c_longlong,
-            ]
-            signer.SignUpdatePublicPool.restype = StrOrErr
+        # Get API URL from client config for nonce initialization
+        client_key = get_client_key(request.api_key_index, request.account_index)
+        client_config = clients.get(client_key)
+        api_url = client_config.get("url") if client_config else None
 
-            result = signer.SignUpdatePublicPool(
-                request.public_pool_index,
-                request.status,
-                request.operator_fee,
-                request.min_operator_share_rate,
-                request.nonce
+        # Get account-specific lock to prevent nonce race conditions
+        account_lock = nonce_manager.get_account_lock(request.account_index, request.api_key_index)
+
+        # Hold account lock for the entire nonce get->sign->error handling flow
+        async with account_lock:
+            # Get managed nonce (auto-increment if request.nonce == -1)
+            managed_nonce = await nonce_manager.get_next_nonce(
+                account_index=request.account_index,
+                api_key_index=request.api_key_index,
+                provided_nonce=request.nonce,
+                api_url=api_url
             )
 
-            tx_info = result.str.decode("utf-8") if result.str else None
-            error = result.err.decode("utf-8") if result.err else None
+            # Acquire global lock to ensure atomic switch + sign (protects C library calls)
+            async with global_signer_lock:
+                await _switch_api_key_internal(request.api_key_index)
 
-            if error:
-                raise HTTPException(status_code=400, detail=error)
+                signer.SignUpdatePublicPool.argtypes = [
+                    ctypes.c_longlong,
+                    ctypes.c_int,
+                    ctypes.c_longlong,
+                    ctypes.c_longlong,
+                    ctypes.c_longlong,
+                ]
+                signer.SignUpdatePublicPool.restype = StrOrErr
 
-        return {"tx_info": tx_info}
+                result = signer.SignUpdatePublicPool(
+                    request.public_pool_index,
+                    request.status,
+                    request.operator_fee,
+                    request.min_operator_share_rate,
+                    managed_nonce
+                )
+
+                tx_info = result.str.decode("utf-8") if result.str else None
+                error = result.err.decode("utf-8") if result.err else None
+
+                if error:
+                    # Check for nonce-related errors
+                    if "invalid nonce" in error.lower() or "nonce" in error.lower():
+                        logging.warning(f"Nonce error detected in sign_update_public_pool: {error}")
+                        await nonce_manager.hard_refresh_nonce(request.account_index, request.api_key_index)
+                    else:
+                        await nonce_manager.acknowledge_failure(request.account_index, request.api_key_index)
+
+                    raise HTTPException(status_code=400, detail=error)
+
+            return {"tx_info": tx_info}
+    except HTTPException:
+        raise
     except Exception as e:
+        logging.error(f"Error in sign_update_public_pool: {e}")
+        # Rollback nonce on unexpected error
+        try:
+            await nonce_manager.acknowledge_failure(request.account_index, request.api_key_index)
+        except:
+            pass
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/sign_mint_shares")
 async def sign_mint_shares(request: SignMintSharesRequest):
     """
-    Sign a mint shares transaction. Thread-safe with global locking.
+    Sign a mint shares transaction with per-account locking to prevent nonce conflicts.
+    Uses account-specific locks to serialize requests for the same (account_index, api_key_index).
     """
     try:
-        # Acquire global lock to ensure atomic switch + sign
-        async with global_signer_lock:
-            await _switch_api_key_internal(request.api_key_index)
+        if not signer:
+            raise HTTPException(status_code=500, detail="Signer not initialized")
 
-            signer.SignMintShares.argtypes = [
-                ctypes.c_longlong,
-                ctypes.c_longlong,
-                ctypes.c_longlong,
-            ]
-            signer.SignMintShares.restype = StrOrErr
+        # Get API URL from client config for nonce initialization
+        client_key = get_client_key(request.api_key_index, request.account_index)
+        client_config = clients.get(client_key)
+        api_url = client_config.get("url") if client_config else None
 
-            result = signer.SignMintShares(
-                request.public_pool_index,
-                request.share_amount,
-                request.nonce
+        # Get account-specific lock to prevent nonce race conditions
+        account_lock = nonce_manager.get_account_lock(request.account_index, request.api_key_index)
+
+        # Hold account lock for the entire nonce get->sign->error handling flow
+        async with account_lock:
+            # Get managed nonce (auto-increment if request.nonce == -1)
+            managed_nonce = await nonce_manager.get_next_nonce(
+                account_index=request.account_index,
+                api_key_index=request.api_key_index,
+                provided_nonce=request.nonce,
+                api_url=api_url
             )
 
-            tx_info = result.str.decode("utf-8") if result.str else None
-            error = result.err.decode("utf-8") if result.err else None
+            # Acquire global lock to ensure atomic switch + sign (protects C library calls)
+            async with global_signer_lock:
+                await _switch_api_key_internal(request.api_key_index)
 
-            if error:
-                raise HTTPException(status_code=400, detail=error)
+                signer.SignMintShares.argtypes = [
+                    ctypes.c_longlong,
+                    ctypes.c_longlong,
+                    ctypes.c_longlong,
+                ]
+                signer.SignMintShares.restype = StrOrErr
 
-        return {"tx_info": tx_info}
+                result = signer.SignMintShares(
+                    request.public_pool_index,
+                    request.share_amount,
+                    managed_nonce
+                )
+
+                tx_info = result.str.decode("utf-8") if result.str else None
+                error = result.err.decode("utf-8") if result.err else None
+
+                if error:
+                    # Check for nonce-related errors
+                    if "invalid nonce" in error.lower() or "nonce" in error.lower():
+                        logging.warning(f"Nonce error detected in sign_mint_shares: {error}")
+                        await nonce_manager.hard_refresh_nonce(request.account_index, request.api_key_index)
+                    else:
+                        await nonce_manager.acknowledge_failure(request.account_index, request.api_key_index)
+
+                    raise HTTPException(status_code=400, detail=error)
+
+            return {"tx_info": tx_info}
+    except HTTPException:
+        raise
     except Exception as e:
+        logging.error(f"Error in sign_mint_shares: {e}")
+        # Rollback nonce on unexpected error
+        try:
+            await nonce_manager.acknowledge_failure(request.account_index, request.api_key_index)
+        except:
+            pass
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/sign_burn_shares")
 async def sign_burn_shares(request: SignBurnSharesRequest):
     """
-    Sign a burn shares transaction. Thread-safe with global locking.
+    Sign a burn shares transaction with per-account locking to prevent nonce conflicts.
+    Uses account-specific locks to serialize requests for the same (account_index, api_key_index).
     """
     try:
-        # Acquire global lock to ensure atomic switch + sign
-        async with global_signer_lock:
-            await _switch_api_key_internal(request.api_key_index)
+        if not signer:
+            raise HTTPException(status_code=500, detail="Signer not initialized")
 
-            signer.SignBurnShares.argtypes = [
-                ctypes.c_longlong,
-                ctypes.c_longlong,
-                ctypes.c_longlong,
-            ]
-            signer.SignBurnShares.restype = StrOrErr
+        # Get API URL from client config for nonce initialization
+        client_key = get_client_key(request.api_key_index, request.account_index)
+        client_config = clients.get(client_key)
+        api_url = client_config.get("url") if client_config else None
 
-            result = signer.SignBurnShares(
-                request.public_pool_index,
-                request.share_amount,
-                request.nonce
+        # Get account-specific lock to prevent nonce race conditions
+        account_lock = nonce_manager.get_account_lock(request.account_index, request.api_key_index)
+
+        # Hold account lock for the entire nonce get->sign->error handling flow
+        async with account_lock:
+            # Get managed nonce (auto-increment if request.nonce == -1)
+            managed_nonce = await nonce_manager.get_next_nonce(
+                account_index=request.account_index,
+                api_key_index=request.api_key_index,
+                provided_nonce=request.nonce,
+                api_url=api_url
             )
 
-            tx_info = result.str.decode("utf-8") if result.str else None
-            error = result.err.decode("utf-8") if result.err else None
+            # Acquire global lock to ensure atomic switch + sign (protects C library calls)
+            async with global_signer_lock:
+                await _switch_api_key_internal(request.api_key_index)
 
-            if error:
-                raise HTTPException(status_code=400, detail=error)
+                signer.SignBurnShares.argtypes = [
+                    ctypes.c_longlong,
+                    ctypes.c_longlong,
+                    ctypes.c_longlong,
+                ]
+                signer.SignBurnShares.restype = StrOrErr
 
-        return {"tx_info": tx_info}
+                result = signer.SignBurnShares(
+                    request.public_pool_index,
+                    request.share_amount,
+                    managed_nonce
+                )
+
+                tx_info = result.str.decode("utf-8") if result.str else None
+                error = result.err.decode("utf-8") if result.err else None
+
+                if error:
+                    # Check for nonce-related errors
+                    if "invalid nonce" in error.lower() or "nonce" in error.lower():
+                        logging.warning(f"Nonce error detected in sign_burn_shares: {error}")
+                        await nonce_manager.hard_refresh_nonce(request.account_index, request.api_key_index)
+                    else:
+                        await nonce_manager.acknowledge_failure(request.account_index, request.api_key_index)
+
+                    raise HTTPException(status_code=400, detail=error)
+
+            return {"tx_info": tx_info}
+    except HTTPException:
+        raise
     except Exception as e:
+        logging.error(f"Error in sign_burn_shares: {e}")
+        # Rollback nonce on unexpected error
+        try:
+            await nonce_manager.acknowledge_failure(request.account_index, request.api_key_index)
+        except:
+            pass
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/sign_update_leverage")
 async def sign_update_leverage(request: SignUpdateLeverageRequest):
     """
-    Sign an update leverage transaction. Thread-safe with global locking.
+    Sign an update leverage transaction with per-account locking to prevent nonce conflicts.
+    Uses account-specific locks to serialize requests for the same (account_index, api_key_index).
     """
     try:
-        # Acquire global lock to ensure atomic switch + sign
-        async with global_signer_lock:
-            await _switch_api_key_internal(request.api_key_index)
+        if not signer:
+            raise HTTPException(status_code=500, detail="Signer not initialized")
 
-            signer.SignUpdateLeverage.argtypes = [
-                ctypes.c_int,
-                ctypes.c_int,
-                ctypes.c_int,
-                ctypes.c_longlong,
-            ]
-            signer.SignUpdateLeverage.restype = StrOrErr
+        # Get API URL from client config for nonce initialization
+        client_key = get_client_key(request.api_key_index, request.account_index)
+        client_config = clients.get(client_key)
+        api_url = client_config.get("url") if client_config else None
 
-            result = signer.SignUpdateLeverage(
-                request.market_index,
-                request.fraction,
-                request.margin_mode,
-                request.nonce
+        # Get account-specific lock to prevent nonce race conditions
+        account_lock = nonce_manager.get_account_lock(request.account_index, request.api_key_index)
+
+        # Hold account lock for the entire nonce get->sign->error handling flow
+        async with account_lock:
+            # Get managed nonce (auto-increment if request.nonce == -1)
+            managed_nonce = await nonce_manager.get_next_nonce(
+                account_index=request.account_index,
+                api_key_index=request.api_key_index,
+                provided_nonce=request.nonce,
+                api_url=api_url
             )
 
-            tx_info = result.str.decode("utf-8") if result.str else None
-            error = result.err.decode("utf-8") if result.err else None
+            # Acquire global lock to ensure atomic switch + sign (protects C library calls)
+            async with global_signer_lock:
+                await _switch_api_key_internal(request.api_key_index)
 
-            if error:
-                raise HTTPException(status_code=400, detail=error)
+                signer.SignUpdateLeverage.argtypes = [
+                    ctypes.c_int,
+                    ctypes.c_int,
+                    ctypes.c_int,
+                    ctypes.c_longlong,
+                ]
+                signer.SignUpdateLeverage.restype = StrOrErr
 
-        return {"tx_info": tx_info}
+                result = signer.SignUpdateLeverage(
+                    request.market_index,
+                    request.fraction,
+                    request.margin_mode,
+                    managed_nonce
+                )
+
+                tx_info = result.str.decode("utf-8") if result.str else None
+                error = result.err.decode("utf-8") if result.err else None
+
+                if error:
+                    # Check for nonce-related errors
+                    if "invalid nonce" in error.lower() or "nonce" in error.lower():
+                        logging.warning(f"Nonce error detected in sign_update_leverage: {error}")
+                        await nonce_manager.hard_refresh_nonce(request.account_index, request.api_key_index)
+                    else:
+                        await nonce_manager.acknowledge_failure(request.account_index, request.api_key_index)
+
+                    raise HTTPException(status_code=400, detail=error)
+
+            return {"tx_info": tx_info}
+    except HTTPException:
+        raise
     except Exception as e:
+        logging.error(f"Error in sign_update_leverage: {e}")
+        # Rollback nonce on unexpected error
+        try:
+            await nonce_manager.acknowledge_failure(request.account_index, request.api_key_index)
+        except:
+            pass
         raise HTTPException(status_code=500, detail=str(e))
 
 
