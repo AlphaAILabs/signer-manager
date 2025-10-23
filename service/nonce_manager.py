@@ -32,15 +32,8 @@ class NonceManager:
     def __init__(self):
         # Per-account locks to serialize requests for the same (account_index, api_key_index)
         self.account_locks: Dict[Tuple[int, int], asyncio.Lock] = {}
-
-    async def initialize_account(self, account_index: int, api_key_index: int, api_url: str):
-        """
-        No-op: Account initialization not needed
-
-        Client manages nonce by fetching from Lighter API.
-        account_lock is created on-demand in get_account_lock().
-        """
-        pass
+        # Lock to protect account_locks dictionary during concurrent access
+        self._locks_creation_lock = asyncio.Lock()
 
     async def get_next_nonce(
         self,
@@ -77,10 +70,12 @@ class NonceManager:
         # Simply return client's value - no cache, no auto-increment, no interference
         return provided_nonce
 
-    def get_account_lock(self, account_index: int, api_key_index: int) -> asyncio.Lock:
+    async def get_account_lock(self, account_index: int, api_key_index: int) -> asyncio.Lock:
         """
         Get or create a lock for a specific (account_index, api_key_index) pair.
         This lock should be held during the entire signing process to prevent race conditions.
+
+        Thread-safe: Uses _locks_creation_lock to prevent race conditions when creating new locks.
 
         Args:
             account_index: Account index
@@ -90,9 +85,17 @@ class NonceManager:
             Lock for this account/api_key pair
         """
         key = (account_index, api_key_index)
-        if key not in self.account_locks:
-            self.account_locks[key] = asyncio.Lock()
-        return self.account_locks[key]
+
+        # Fast path: lock already exists
+        if key in self.account_locks:
+            return self.account_locks[key]
+
+        # Slow path: need to create lock (protected by creation lock)
+        async with self._locks_creation_lock:
+            # Double-check: another thread might have created it while we waited
+            if key not in self.account_locks:
+                self.account_locks[key] = asyncio.Lock()
+            return self.account_locks[key]
 
 
 # Global singleton instance

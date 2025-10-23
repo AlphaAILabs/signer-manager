@@ -116,13 +116,25 @@ except Exception as e:
 clients = {}
 api_key_dict = {}  # Store api_key_index -> private_key mapping
 
-# Global lock to ensure thread safety
-# CRITICAL: The underlying Go library (sharedlib.go) uses unprotected global state:
-#   - var txClient *Client (current active client)
-#   - var backupTxClients map[uint8]*Client (client storage)
-# SwitchAPIKey() modifies txClient without synchronization, creating race conditions.
-# This global lock ensures that switch + sign operations are atomic across ALL accounts.
-# Trade-off: Sacrifices concurrency for correctness - all signing operations are serialized.
+# Global lock to ensure thread safety for Go SDK
+# CRITICAL: The underlying Go library (lighter-go sharedlib.go) is NOT thread-safe:
+#   - var txClient *Client (current active client - GLOBAL STATE)
+#   - var backupTxClients map[uint8]*Client (client storage - GLOBAL STATE)
+#   - SwitchAPIKey() modifies txClient WITHOUT synchronization
+#   - CheckClient() may switch internal state
+#
+# Lock ordering is CRITICAL:
+#   1. global_signer_lock (OUTERMOST) - Protects Go SDK global state
+#   2. account_lock (INNER) - Serializes nonce operations for same account
+#
+# WHY this order matters:
+#   - If account_lock were outer, different accounts could hold different account_locks,
+#     then compete for global_signer_lock, causing Go SDK state to be polluted between
+#     different accounts' signing operations
+#   - With global_signer_lock outer, only ONE account can interact with Go SDK at a time,
+#     preventing all race conditions
+#
+# Trade-off: Sacrifices concurrency for correctness - all Go SDK operations are serialized.
 global_signer_lock = asyncio.Lock()
 
 
@@ -381,16 +393,6 @@ async def create_client(request: CreateClientRequest):
                 "account_index": request.account_index
             }
 
-            # Initialize nonce for this account/api_key
-            try:
-                await nonce_manager.initialize_account(
-                    account_index=request.account_index,
-                    api_key_index=request.api_key_index,
-                    api_url=request.url
-                )
-            except Exception as e:
-                logger.warning(f"Could not initialize nonce from API: {e}, will use auto-increment from 0")
-
         return {"message": "Client created successfully", "client_key": client_key}
     except HTTPException:
         raise
@@ -488,21 +490,23 @@ async def sign_change_api_key(request: SignChangeApiKeyRequest):
         client_config = clients.get(client_key)
         api_url = client_config.get("url") if client_config else None
 
-        # Get account-specific lock to prevent nonce race conditions
-        account_lock = nonce_manager.get_account_lock(request.account_index, request.api_key_index)
+        # CRITICAL: Global lock MUST be outermost to prevent Go SDK state pollution
+        # Without this, different accounts can hold different account_locks simultaneously,
+        # then compete for global_signer_lock, causing state corruption
+        async with global_signer_lock:
+            # Get account-specific lock to prevent nonce race conditions for same account
+            account_lock = await nonce_manager.get_account_lock(request.account_index, request.api_key_index)
 
-        # Hold account lock for the entire nonce get->sign->error handling flow
-        async with account_lock:
-            # Get managed nonce (auto-increment if request.nonce == -1)
-            managed_nonce = await nonce_manager.get_next_nonce(
-                account_index=request.account_index,
-                api_key_index=request.api_key_index,
-                provided_nonce=request.nonce,
-                api_url=api_url
-            )
+            async with account_lock:
+                # Get managed nonce (auto-increment if request.nonce == -1)
+                managed_nonce = await nonce_manager.get_next_nonce(
+                    account_index=request.account_index,
+                    api_key_index=request.api_key_index,
+                    provided_nonce=request.nonce,
+                    api_url=api_url
+                )
 
-            # Acquire global lock to ensure atomic switch + sign (protects C library calls)
-            async with global_signer_lock:
+                # Activate client (already protected by global lock)
                 await _activate_client_internal(request.api_key_index, request.account_index)
 
                 signer.SignChangePubKey.argtypes = [
@@ -528,6 +532,7 @@ async def sign_change_api_key(request: SignChangeApiKeyRequest):
                 signature = acct.sign_message(message)
                 tx_info["L1Sig"] = signature.signature.to_0x_hex()
 
+            # Success - return result
             return {"tx_info": json.dumps(tx_info)}
     except HTTPException:
         raise
@@ -539,9 +544,13 @@ async def sign_change_api_key(request: SignChangeApiKeyRequest):
 @app.post("/sign_create_order")
 async def sign_create_order(request: SignCreateOrderRequest):
     """
-    Sign a create order transaction with per-account locking to prevent nonce conflicts.
-    Uses account-specific locks to serialize requests for the same (account_index, api_key_index).
-    Different accounts can process requests concurrently without blocking each other.
+    Sign a create order transaction with strict serialization for Go SDK safety.
+
+    Lock ordering (CRITICAL for correctness):
+    1. global_signer_lock (outermost) - Protects non-thread-safe Go SDK
+    2. account_lock (inner) - Serializes nonce operations for same account
+
+    All Go SDK operations are fully serialized to prevent state corruption.
     """
     try:
         if not signer:
@@ -552,31 +561,32 @@ async def sign_create_order(request: SignCreateOrderRequest):
         client_config = clients.get(client_key)
         api_url = client_config.get("url") if client_config else None
 
-        # Get account-specific lock to prevent nonce race conditions
-        # This ensures requests for the same (account_index, api_key_index) are serialized
-        account_lock = nonce_manager.get_account_lock(request.account_index, request.api_key_index)
+        # CRITICAL: Global lock MUST be outermost to prevent Go SDK state pollution
+        # Without this, different accounts can hold different account_locks simultaneously,
+        # then compete for global_signer_lock, causing state corruption
+        async with global_signer_lock:
+            # Get account-specific lock to prevent nonce race conditions for same account
+            account_lock = await nonce_manager.get_account_lock(request.account_index, request.api_key_index)
 
-        # Hold account lock for the entire nonce get->sign->error handling flow
-        async with account_lock:
-            # Get managed nonce (auto-increment if request.nonce == -1)
-            managed_nonce = await nonce_manager.get_next_nonce(
-                account_index=request.account_index,
-                api_key_index=request.api_key_index,
-                provided_nonce=request.nonce,
-                api_url=api_url
-            )
+            async with account_lock:
+                # Get managed nonce (auto-increment if request.nonce == -1)
+                managed_nonce = await nonce_manager.get_next_nonce(
+                    account_index=request.account_index,
+                    api_key_index=request.api_key_index,
+                    provided_nonce=request.nonce,
+                    api_url=api_url
+                )
 
-            logging.debug(f"sign_create_order request: api_key_index={request.api_key_index}, "
-                         f"market_index={request.market_index}, "
-                         f"client_order_index={request.client_order_index}, base_amount={request.base_amount}, "
-                         f"price={request.price}, is_ask={request.is_ask}, "
-                         f"order_type={request.order_type}, time_in_force={request.time_in_force}, "
-                         f"reduce_only={request.reduce_only}, "
-                         f"trigger_price={request.trigger_price}, order_expiry={request.order_expiry}, "
-                         f"nonce={request.nonce} → managed_nonce={managed_nonce}")
+                logging.debug(f"sign_create_order request: api_key_index={request.api_key_index}, "
+                             f"market_index={request.market_index}, "
+                             f"client_order_index={request.client_order_index}, base_amount={request.base_amount}, "
+                             f"price={request.price}, is_ask={request.is_ask}, "
+                             f"order_type={request.order_type}, time_in_force={request.time_in_force}, "
+                             f"reduce_only={request.reduce_only}, "
+                             f"trigger_price={request.trigger_price}, order_expiry={request.order_expiry}, "
+                             f"nonce={request.nonce} → managed_nonce={managed_nonce}")
 
-            # Acquire global lock to ensure atomic switch + sign (protects C library calls)
-            async with global_signer_lock:
+                # Activate client (already protected by global lock)
                 await _activate_client_internal(request.api_key_index, request.account_index)
 
                 signer.SignCreateOrder.argtypes = [
@@ -612,7 +622,6 @@ async def sign_create_order(request: SignCreateOrderRequest):
                 error = result.err.decode("utf-8") if result.err else None
 
                 if error:
-
                     raise HTTPException(status_code=400, detail=error)
 
             # Success - nonce manager already incremented
@@ -639,21 +648,23 @@ async def sign_cancel_order(request: SignCancelOrderRequest):
         client_config = clients.get(client_key)
         api_url = client_config.get("url") if client_config else None
 
-        # Get account-specific lock to prevent nonce race conditions
-        account_lock = nonce_manager.get_account_lock(request.account_index, request.api_key_index)
+        # CRITICAL: Global lock MUST be outermost to prevent Go SDK state pollution
+        # Without this, different accounts can hold different account_locks simultaneously,
+        # then compete for global_signer_lock, causing state corruption
+        async with global_signer_lock:
+            # Get account-specific lock to prevent nonce race conditions for same account
+            account_lock = await nonce_manager.get_account_lock(request.account_index, request.api_key_index)
 
-        # Hold account lock for the entire nonce get->sign->error handling flow
-        async with account_lock:
-            # Get managed nonce (auto-increment if request.nonce == -1)
-            managed_nonce = await nonce_manager.get_next_nonce(
-                account_index=request.account_index,
-                api_key_index=request.api_key_index,
-                provided_nonce=request.nonce,
-                api_url=api_url
-            )
+            async with account_lock:
+                # Get managed nonce (auto-increment if request.nonce == -1)
+                managed_nonce = await nonce_manager.get_next_nonce(
+                    account_index=request.account_index,
+                    api_key_index=request.api_key_index,
+                    provided_nonce=request.nonce,
+                    api_url=api_url
+                )
 
-            # Acquire global lock to ensure atomic switch + sign (protects C library calls)
-            async with global_signer_lock:
+                # Activate client (already protected by global lock)
                 await _activate_client_internal(request.api_key_index, request.account_index)
 
                 signer.SignCancelOrder.argtypes = [
@@ -669,9 +680,9 @@ async def sign_cancel_order(request: SignCancelOrderRequest):
                 error = result.err.decode("utf-8") if result.err else None
 
                 if error:
-
                     raise HTTPException(status_code=400, detail=error)
 
+                # Success - return result
             return {"tx_info": tx_info}
     except HTTPException:
         raise
@@ -695,21 +706,23 @@ async def sign_withdraw(request: SignWithdrawRequest):
         client_config = clients.get(client_key)
         api_url = client_config.get("url") if client_config else None
 
-        # Get account-specific lock to prevent nonce race conditions
-        account_lock = nonce_manager.get_account_lock(request.account_index, request.api_key_index)
+        # CRITICAL: Global lock MUST be outermost to prevent Go SDK state pollution
+        # Without this, different accounts can hold different account_locks simultaneously,
+        # then compete for global_signer_lock, causing state corruption
+        async with global_signer_lock:
+            # Get account-specific lock to prevent nonce race conditions for same account
+            account_lock = await nonce_manager.get_account_lock(request.account_index, request.api_key_index)
 
-        # Hold account lock for the entire nonce get->sign->error handling flow
-        async with account_lock:
-            # Get managed nonce (auto-increment if request.nonce == -1)
-            managed_nonce = await nonce_manager.get_next_nonce(
-                account_index=request.account_index,
-                api_key_index=request.api_key_index,
-                provided_nonce=request.nonce,
-                api_url=api_url
-            )
+            async with account_lock:
+                # Get managed nonce (auto-increment if request.nonce == -1)
+                managed_nonce = await nonce_manager.get_next_nonce(
+                    account_index=request.account_index,
+                    api_key_index=request.api_key_index,
+                    provided_nonce=request.nonce,
+                    api_url=api_url
+                )
 
-            # Acquire global lock to ensure atomic switch + sign (protects C library calls)
-            async with global_signer_lock:
+                # Activate client (already protected by global lock)
                 await _activate_client_internal(request.api_key_index, request.account_index)
 
                 signer.SignWithdraw.argtypes = [ctypes.c_longlong, ctypes.c_longlong]
@@ -721,9 +734,9 @@ async def sign_withdraw(request: SignWithdrawRequest):
                 error = result.err.decode("utf-8") if result.err else None
 
                 if error:
-
                     raise HTTPException(status_code=400, detail=error)
 
+                # Success - return result
             return {"tx_info": tx_info}
     except HTTPException:
         raise
@@ -747,21 +760,23 @@ async def sign_create_sub_account(request: SignCreateSubAccountRequest):
         client_config = clients.get(client_key)
         api_url = client_config.get("url") if client_config else None
 
-        # Get account-specific lock to prevent nonce race conditions
-        account_lock = nonce_manager.get_account_lock(request.account_index, request.api_key_index)
+        # CRITICAL: Global lock MUST be outermost to prevent Go SDK state pollution
+        # Without this, different accounts can hold different account_locks simultaneously,
+        # then compete for global_signer_lock, causing state corruption
+        async with global_signer_lock:
+            # Get account-specific lock to prevent nonce race conditions for same account
+            account_lock = await nonce_manager.get_account_lock(request.account_index, request.api_key_index)
 
-        # Hold account lock for the entire nonce get->sign->error handling flow
-        async with account_lock:
-            # Get managed nonce (auto-increment if request.nonce == -1)
-            managed_nonce = await nonce_manager.get_next_nonce(
-                account_index=request.account_index,
-                api_key_index=request.api_key_index,
-                provided_nonce=request.nonce,
-                api_url=api_url
-            )
+            async with account_lock:
+                # Get managed nonce (auto-increment if request.nonce == -1)
+                managed_nonce = await nonce_manager.get_next_nonce(
+                    account_index=request.account_index,
+                    api_key_index=request.api_key_index,
+                    provided_nonce=request.nonce,
+                    api_url=api_url
+                )
 
-            # Acquire global lock to ensure atomic switch + sign (protects C library calls)
-            async with global_signer_lock:
+                # Activate client (already protected by global lock)
                 await _activate_client_internal(request.api_key_index, request.account_index)
 
                 signer.SignCreateSubAccount.argtypes = [ctypes.c_longlong]
@@ -773,9 +788,9 @@ async def sign_create_sub_account(request: SignCreateSubAccountRequest):
                 error = result.err.decode("utf-8") if result.err else None
 
                 if error:
-
                     raise HTTPException(status_code=400, detail=error)
 
+                # Success - return result
             return {"tx_info": tx_info}
     except HTTPException:
         raise
@@ -799,21 +814,23 @@ async def sign_cancel_all_orders(request: SignCancelAllOrdersRequest):
         client_config = clients.get(client_key)
         api_url = client_config.get("url") if client_config else None
 
-        # Get account-specific lock to prevent nonce race conditions
-        account_lock = nonce_manager.get_account_lock(request.account_index, request.api_key_index)
+        # CRITICAL: Global lock MUST be outermost to prevent Go SDK state pollution
+        # Without this, different accounts can hold different account_locks simultaneously,
+        # then compete for global_signer_lock, causing state corruption
+        async with global_signer_lock:
+            # Get account-specific lock to prevent nonce race conditions for same account
+            account_lock = await nonce_manager.get_account_lock(request.account_index, request.api_key_index)
 
-        # Hold account lock for the entire nonce get->sign->error handling flow
-        async with account_lock:
-            # Get managed nonce (auto-increment if request.nonce == -1)
-            managed_nonce = await nonce_manager.get_next_nonce(
-                account_index=request.account_index,
-                api_key_index=request.api_key_index,
-                provided_nonce=request.nonce,
-                api_url=api_url
-            )
+            async with account_lock:
+                # Get managed nonce (auto-increment if request.nonce == -1)
+                managed_nonce = await nonce_manager.get_next_nonce(
+                    account_index=request.account_index,
+                    api_key_index=request.api_key_index,
+                    provided_nonce=request.nonce,
+                    api_url=api_url
+                )
 
-            # Acquire global lock to ensure atomic switch + sign (protects C library calls)
-            async with global_signer_lock:
+                # Activate client (already protected by global lock)
                 await _activate_client_internal(request.api_key_index, request.account_index)
 
                 signer.SignCancelAllOrders.argtypes = [
@@ -829,9 +846,9 @@ async def sign_cancel_all_orders(request: SignCancelAllOrdersRequest):
                 error = result.err.decode("utf-8") if result.err else None
 
                 if error:
-
                     raise HTTPException(status_code=400, detail=error)
 
+                # Success - return result
             return {"tx_info": tx_info}
     except HTTPException:
         raise
@@ -855,21 +872,23 @@ async def sign_modify_order(request: SignModifyOrderRequest):
         client_config = clients.get(client_key)
         api_url = client_config.get("url") if client_config else None
 
-        # Get account-specific lock to prevent nonce race conditions
-        account_lock = nonce_manager.get_account_lock(request.account_index, request.api_key_index)
+        # CRITICAL: Global lock MUST be outermost to prevent Go SDK state pollution
+        # Without this, different accounts can hold different account_locks simultaneously,
+        # then compete for global_signer_lock, causing state corruption
+        async with global_signer_lock:
+            # Get account-specific lock to prevent nonce race conditions for same account
+            account_lock = await nonce_manager.get_account_lock(request.account_index, request.api_key_index)
 
-        # Hold account lock for the entire nonce get->sign->error handling flow
-        async with account_lock:
-            # Get managed nonce (auto-increment if request.nonce == -1)
-            managed_nonce = await nonce_manager.get_next_nonce(
-                account_index=request.account_index,
-                api_key_index=request.api_key_index,
-                provided_nonce=request.nonce,
-                api_url=api_url
-            )
+            async with account_lock:
+                # Get managed nonce (auto-increment if request.nonce == -1)
+                managed_nonce = await nonce_manager.get_next_nonce(
+                    account_index=request.account_index,
+                    api_key_index=request.api_key_index,
+                    provided_nonce=request.nonce,
+                    api_url=api_url
+                )
 
-            # Acquire global lock to ensure atomic switch + sign (protects C library calls)
-            async with global_signer_lock:
+                # Activate client (already protected by global lock)
                 await _activate_client_internal(request.api_key_index, request.account_index)
 
                 signer.SignModifyOrder.argtypes = [
@@ -895,9 +914,9 @@ async def sign_modify_order(request: SignModifyOrderRequest):
                 error = result.err.decode("utf-8") if result.err else None
 
                 if error:
-
                     raise HTTPException(status_code=400, detail=error)
 
+                # Success - return result
             return {"tx_info": tx_info}
     except HTTPException:
         raise
@@ -921,21 +940,23 @@ async def sign_transfer(request: SignTransferRequest):
         client_config = clients.get(client_key)
         api_url = client_config.get("url") if client_config else None
 
-        # Get account-specific lock to prevent nonce race conditions
-        account_lock = nonce_manager.get_account_lock(request.account_index, request.api_key_index)
+        # CRITICAL: Global lock MUST be outermost to prevent Go SDK state pollution
+        # Without this, different accounts can hold different account_locks simultaneously,
+        # then compete for global_signer_lock, causing state corruption
+        async with global_signer_lock:
+            # Get account-specific lock to prevent nonce race conditions for same account
+            account_lock = await nonce_manager.get_account_lock(request.account_index, request.api_key_index)
 
-        # Hold account lock for the entire nonce get->sign->error handling flow
-        async with account_lock:
-            # Get managed nonce (auto-increment if request.nonce == -1)
-            managed_nonce = await nonce_manager.get_next_nonce(
-                account_index=request.account_index,
-                api_key_index=request.api_key_index,
-                provided_nonce=request.nonce,
-                api_url=api_url
-            )
+            async with account_lock:
+                # Get managed nonce (auto-increment if request.nonce == -1)
+                managed_nonce = await nonce_manager.get_next_nonce(
+                    account_index=request.account_index,
+                    api_key_index=request.api_key_index,
+                    provided_nonce=request.nonce,
+                    api_url=api_url
+                )
 
-            # Acquire global lock to ensure atomic switch + sign (protects C library calls)
-            async with global_signer_lock:
+                # Activate client (already protected by global lock)
                 await _activate_client_internal(request.api_key_index, request.account_index)
 
                 signer.SignTransfer.argtypes = [
@@ -971,6 +992,7 @@ async def sign_transfer(request: SignTransferRequest):
                 signature = acct.sign_message(message)
                 tx_info["L1Sig"] = signature.signature.to_0x_hex()
 
+            # Success - return result
             return {"tx_info": json.dumps(tx_info)}
     except HTTPException:
         raise
@@ -994,21 +1016,23 @@ async def sign_create_public_pool(request: SignCreatePublicPoolRequest):
         client_config = clients.get(client_key)
         api_url = client_config.get("url") if client_config else None
 
-        # Get account-specific lock to prevent nonce race conditions
-        account_lock = nonce_manager.get_account_lock(request.account_index, request.api_key_index)
+        # CRITICAL: Global lock MUST be outermost to prevent Go SDK state pollution
+        # Without this, different accounts can hold different account_locks simultaneously,
+        # then compete for global_signer_lock, causing state corruption
+        async with global_signer_lock:
+            # Get account-specific lock to prevent nonce race conditions for same account
+            account_lock = await nonce_manager.get_account_lock(request.account_index, request.api_key_index)
 
-        # Hold account lock for the entire nonce get->sign->error handling flow
-        async with account_lock:
-            # Get managed nonce (auto-increment if request.nonce == -1)
-            managed_nonce = await nonce_manager.get_next_nonce(
-                account_index=request.account_index,
-                api_key_index=request.api_key_index,
-                provided_nonce=request.nonce,
-                api_url=api_url
-            )
+            async with account_lock:
+                # Get managed nonce (auto-increment if request.nonce == -1)
+                managed_nonce = await nonce_manager.get_next_nonce(
+                    account_index=request.account_index,
+                    api_key_index=request.api_key_index,
+                    provided_nonce=request.nonce,
+                    api_url=api_url
+                )
 
-            # Acquire global lock to ensure atomic switch + sign (protects C library calls)
-            async with global_signer_lock:
+                # Activate client (already protected by global lock)
                 await _activate_client_internal(request.api_key_index, request.account_index)
 
                 signer.SignCreatePublicPool.argtypes = [
@@ -1030,9 +1054,9 @@ async def sign_create_public_pool(request: SignCreatePublicPoolRequest):
                 error = result.err.decode("utf-8") if result.err else None
 
                 if error:
-
                     raise HTTPException(status_code=400, detail=error)
 
+                # Success - return result
             return {"tx_info": tx_info}
     except HTTPException:
         raise
@@ -1056,21 +1080,23 @@ async def sign_update_public_pool(request: SignUpdatePublicPoolRequest):
         client_config = clients.get(client_key)
         api_url = client_config.get("url") if client_config else None
 
-        # Get account-specific lock to prevent nonce race conditions
-        account_lock = nonce_manager.get_account_lock(request.account_index, request.api_key_index)
+        # CRITICAL: Global lock MUST be outermost to prevent Go SDK state pollution
+        # Without this, different accounts can hold different account_locks simultaneously,
+        # then compete for global_signer_lock, causing state corruption
+        async with global_signer_lock:
+            # Get account-specific lock to prevent nonce race conditions for same account
+            account_lock = await nonce_manager.get_account_lock(request.account_index, request.api_key_index)
 
-        # Hold account lock for the entire nonce get->sign->error handling flow
-        async with account_lock:
-            # Get managed nonce (auto-increment if request.nonce == -1)
-            managed_nonce = await nonce_manager.get_next_nonce(
-                account_index=request.account_index,
-                api_key_index=request.api_key_index,
-                provided_nonce=request.nonce,
-                api_url=api_url
-            )
+            async with account_lock:
+                # Get managed nonce (auto-increment if request.nonce == -1)
+                managed_nonce = await nonce_manager.get_next_nonce(
+                    account_index=request.account_index,
+                    api_key_index=request.api_key_index,
+                    provided_nonce=request.nonce,
+                    api_url=api_url
+                )
 
-            # Acquire global lock to ensure atomic switch + sign (protects C library calls)
-            async with global_signer_lock:
+                # Activate client (already protected by global lock)
                 await _activate_client_internal(request.api_key_index, request.account_index)
 
                 signer.SignUpdatePublicPool.argtypes = [
@@ -1094,9 +1120,9 @@ async def sign_update_public_pool(request: SignUpdatePublicPoolRequest):
                 error = result.err.decode("utf-8") if result.err else None
 
                 if error:
-
                     raise HTTPException(status_code=400, detail=error)
 
+                # Success - return result
             return {"tx_info": tx_info}
     except HTTPException:
         raise
@@ -1120,21 +1146,23 @@ async def sign_mint_shares(request: SignMintSharesRequest):
         client_config = clients.get(client_key)
         api_url = client_config.get("url") if client_config else None
 
-        # Get account-specific lock to prevent nonce race conditions
-        account_lock = nonce_manager.get_account_lock(request.account_index, request.api_key_index)
+        # CRITICAL: Global lock MUST be outermost to prevent Go SDK state pollution
+        # Without this, different accounts can hold different account_locks simultaneously,
+        # then compete for global_signer_lock, causing state corruption
+        async with global_signer_lock:
+            # Get account-specific lock to prevent nonce race conditions for same account
+            account_lock = await nonce_manager.get_account_lock(request.account_index, request.api_key_index)
 
-        # Hold account lock for the entire nonce get->sign->error handling flow
-        async with account_lock:
-            # Get managed nonce (auto-increment if request.nonce == -1)
-            managed_nonce = await nonce_manager.get_next_nonce(
-                account_index=request.account_index,
-                api_key_index=request.api_key_index,
-                provided_nonce=request.nonce,
-                api_url=api_url
-            )
+            async with account_lock:
+                # Get managed nonce (auto-increment if request.nonce == -1)
+                managed_nonce = await nonce_manager.get_next_nonce(
+                    account_index=request.account_index,
+                    api_key_index=request.api_key_index,
+                    provided_nonce=request.nonce,
+                    api_url=api_url
+                )
 
-            # Acquire global lock to ensure atomic switch + sign (protects C library calls)
-            async with global_signer_lock:
+                # Activate client (already protected by global lock)
                 await _activate_client_internal(request.api_key_index, request.account_index)
 
                 signer.SignMintShares.argtypes = [
@@ -1154,9 +1182,9 @@ async def sign_mint_shares(request: SignMintSharesRequest):
                 error = result.err.decode("utf-8") if result.err else None
 
                 if error:
-
                     raise HTTPException(status_code=400, detail=error)
 
+                # Success - return result
             return {"tx_info": tx_info}
     except HTTPException:
         raise
@@ -1180,21 +1208,23 @@ async def sign_burn_shares(request: SignBurnSharesRequest):
         client_config = clients.get(client_key)
         api_url = client_config.get("url") if client_config else None
 
-        # Get account-specific lock to prevent nonce race conditions
-        account_lock = nonce_manager.get_account_lock(request.account_index, request.api_key_index)
+        # CRITICAL: Global lock MUST be outermost to prevent Go SDK state pollution
+        # Without this, different accounts can hold different account_locks simultaneously,
+        # then compete for global_signer_lock, causing state corruption
+        async with global_signer_lock:
+            # Get account-specific lock to prevent nonce race conditions for same account
+            account_lock = await nonce_manager.get_account_lock(request.account_index, request.api_key_index)
 
-        # Hold account lock for the entire nonce get->sign->error handling flow
-        async with account_lock:
-            # Get managed nonce (auto-increment if request.nonce == -1)
-            managed_nonce = await nonce_manager.get_next_nonce(
-                account_index=request.account_index,
-                api_key_index=request.api_key_index,
-                provided_nonce=request.nonce,
-                api_url=api_url
-            )
+            async with account_lock:
+                # Get managed nonce (auto-increment if request.nonce == -1)
+                managed_nonce = await nonce_manager.get_next_nonce(
+                    account_index=request.account_index,
+                    api_key_index=request.api_key_index,
+                    provided_nonce=request.nonce,
+                    api_url=api_url
+                )
 
-            # Acquire global lock to ensure atomic switch + sign (protects C library calls)
-            async with global_signer_lock:
+                # Activate client (already protected by global lock)
                 await _activate_client_internal(request.api_key_index, request.account_index)
 
                 signer.SignBurnShares.argtypes = [
@@ -1214,9 +1244,9 @@ async def sign_burn_shares(request: SignBurnSharesRequest):
                 error = result.err.decode("utf-8") if result.err else None
 
                 if error:
-
                     raise HTTPException(status_code=400, detail=error)
 
+                # Success - return result
             return {"tx_info": tx_info}
     except HTTPException:
         raise
@@ -1240,21 +1270,23 @@ async def sign_update_leverage(request: SignUpdateLeverageRequest):
         client_config = clients.get(client_key)
         api_url = client_config.get("url") if client_config else None
 
-        # Get account-specific lock to prevent nonce race conditions
-        account_lock = nonce_manager.get_account_lock(request.account_index, request.api_key_index)
+        # CRITICAL: Global lock MUST be outermost to prevent Go SDK state pollution
+        # Without this, different accounts can hold different account_locks simultaneously,
+        # then compete for global_signer_lock, causing state corruption
+        async with global_signer_lock:
+            # Get account-specific lock to prevent nonce race conditions for same account
+            account_lock = await nonce_manager.get_account_lock(request.account_index, request.api_key_index)
 
-        # Hold account lock for the entire nonce get->sign->error handling flow
-        async with account_lock:
-            # Get managed nonce (auto-increment if request.nonce == -1)
-            managed_nonce = await nonce_manager.get_next_nonce(
-                account_index=request.account_index,
-                api_key_index=request.api_key_index,
-                provided_nonce=request.nonce,
-                api_url=api_url
-            )
+            async with account_lock:
+                # Get managed nonce (auto-increment if request.nonce == -1)
+                managed_nonce = await nonce_manager.get_next_nonce(
+                    account_index=request.account_index,
+                    api_key_index=request.api_key_index,
+                    provided_nonce=request.nonce,
+                    api_url=api_url
+                )
 
-            # Acquire global lock to ensure atomic switch + sign (protects C library calls)
-            async with global_signer_lock:
+                # Activate client (already protected by global lock)
                 await _activate_client_internal(request.api_key_index, request.account_index)
 
                 signer.SignUpdateLeverage.argtypes = [
@@ -1276,9 +1308,9 @@ async def sign_update_leverage(request: SignUpdateLeverageRequest):
                 error = result.err.decode("utf-8") if result.err else None
 
                 if error:
-
                     raise HTTPException(status_code=400, detail=error)
 
+                # Success - return result
             return {"tx_info": tx_info}
     except HTTPException:
         raise
