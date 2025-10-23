@@ -488,12 +488,6 @@ async def sign_change_api_key(request: SignChangeApiKeyRequest):
                 error = result.err.decode("utf-8") if result.err else None
 
                 if error:
-                    # Check for nonce-related errors
-                    if "invalid nonce" in error.lower() or "nonce" in error.lower():
-                        logging.warning(f"Nonce error detected in sign_change_api_key: {error}")
-                        await nonce_manager.hard_refresh_nonce(request.account_index, request.api_key_index)
-                    else:
-                        await nonce_manager.acknowledge_failure(request.account_index, request.api_key_index)
 
                     raise HTTPException(status_code=400, detail=error)
 
@@ -511,11 +505,6 @@ async def sign_change_api_key(request: SignChangeApiKeyRequest):
         raise
     except Exception as e:
         logging.error(f"Error in sign_change_api_key: {e}")
-        # Rollback nonce on unexpected error
-        try:
-            await nonce_manager.acknowledge_failure(request.account_index, request.api_key_index)
-        except:
-            pass
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -595,14 +584,6 @@ async def sign_create_order(request: SignCreateOrderRequest):
                 error = result.err.decode("utf-8") if result.err else None
 
                 if error:
-                    # Check for nonce-related errors
-                    if "invalid nonce" in error.lower() or "nonce" in error.lower():
-                        logging.warning(f"Nonce error detected: {error}")
-                        # Hard refresh nonce from API
-                        await nonce_manager.hard_refresh_nonce(request.account_index, request.api_key_index)
-                    else:
-                        # Other errors: rollback nonce
-                        await nonce_manager.acknowledge_failure(request.account_index, request.api_key_index)
 
                     raise HTTPException(status_code=400, detail=error)
 
@@ -612,11 +593,6 @@ async def sign_create_order(request: SignCreateOrderRequest):
         raise
     except Exception as e:
         logging.error(f"Error in sign_create_order: {e}")
-        # Rollback nonce on unexpected error
-        try:
-            await nonce_manager.acknowledge_failure(request.account_index, request.api_key_index)
-        except:
-            pass
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -665,12 +641,6 @@ async def sign_cancel_order(request: SignCancelOrderRequest):
                 error = result.err.decode("utf-8") if result.err else None
 
                 if error:
-                    # Check for nonce-related errors
-                    if "invalid nonce" in error.lower() or "nonce" in error.lower():
-                        logging.warning(f"Nonce error detected in sign_cancel_order: {error}")
-                        await nonce_manager.hard_refresh_nonce(request.account_index, request.api_key_index)
-                    else:
-                        await nonce_manager.acknowledge_failure(request.account_index, request.api_key_index)
 
                     raise HTTPException(status_code=400, detail=error)
 
@@ -679,11 +649,6 @@ async def sign_cancel_order(request: SignCancelOrderRequest):
         raise
     except Exception as e:
         logging.error(f"Error in sign_cancel_order: {e}")
-        # Rollback nonce on unexpected error
-        try:
-            await nonce_manager.acknowledge_failure(request.account_index, request.api_key_index)
-        except:
-            pass
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -728,12 +693,6 @@ async def sign_withdraw(request: SignWithdrawRequest):
                 error = result.err.decode("utf-8") if result.err else None
 
                 if error:
-                    # Check for nonce-related errors
-                    if "invalid nonce" in error.lower() or "nonce" in error.lower():
-                        logging.warning(f"Nonce error detected in sign_withdraw: {error}")
-                        await nonce_manager.hard_refresh_nonce(request.account_index, request.api_key_index)
-                    else:
-                        await nonce_manager.acknowledge_failure(request.account_index, request.api_key_index)
 
                     raise HTTPException(status_code=400, detail=error)
 
@@ -742,11 +701,6 @@ async def sign_withdraw(request: SignWithdrawRequest):
         raise
     except Exception as e:
         logging.error(f"Error in sign_withdraw: {e}")
-        # Rollback nonce on unexpected error
-        try:
-            await nonce_manager.acknowledge_failure(request.account_index, request.api_key_index)
-        except:
-            pass
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -791,12 +745,6 @@ async def sign_create_sub_account(request: SignCreateSubAccountRequest):
                 error = result.err.decode("utf-8") if result.err else None
 
                 if error:
-                    # Check for nonce-related errors
-                    if "invalid nonce" in error.lower() or "nonce" in error.lower():
-                        logging.warning(f"Nonce error detected in sign_create_sub_account: {error}")
-                        await nonce_manager.hard_refresh_nonce(request.account_index, request.api_key_index)
-                    else:
-                        await nonce_manager.acknowledge_failure(request.account_index, request.api_key_index)
 
                     raise HTTPException(status_code=400, detail=error)
 
@@ -805,11 +753,6 @@ async def sign_create_sub_account(request: SignCreateSubAccountRequest):
         raise
     except Exception as e:
         logging.error(f"Error in sign_create_sub_account: {e}")
-        # Rollback nonce on unexpected error
-        try:
-            await nonce_manager.acknowledge_failure(request.account_index, request.api_key_index)
-        except:
-            pass
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -858,12 +801,6 @@ async def sign_cancel_all_orders(request: SignCancelAllOrdersRequest):
                 error = result.err.decode("utf-8") if result.err else None
 
                 if error:
-                    # Check for nonce-related errors
-                    if "invalid nonce" in error.lower() or "nonce" in error.lower():
-                        logging.warning(f"Nonce error detected in sign_cancel_all_orders: {error}")
-                        await nonce_manager.hard_refresh_nonce(request.account_index, request.api_key_index)
-                    else:
-                        await nonce_manager.acknowledge_failure(request.account_index, request.api_key_index)
 
                     raise HTTPException(status_code=400, detail=error)
 
@@ -872,11 +809,6 @@ async def sign_cancel_all_orders(request: SignCancelAllOrdersRequest):
         raise
     except Exception as e:
         logging.error(f"Error in sign_cancel_all_orders: {e}")
-        # Rollback nonce on unexpected error
-        try:
-            await nonce_manager.acknowledge_failure(request.account_index, request.api_key_index)
-        except:
-            pass
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -935,12 +867,6 @@ async def sign_modify_order(request: SignModifyOrderRequest):
                 error = result.err.decode("utf-8") if result.err else None
 
                 if error:
-                    # Check for nonce-related errors
-                    if "invalid nonce" in error.lower() or "nonce" in error.lower():
-                        logging.warning(f"Nonce error detected in sign_modify_order: {error}")
-                        await nonce_manager.hard_refresh_nonce(request.account_index, request.api_key_index)
-                    else:
-                        await nonce_manager.acknowledge_failure(request.account_index, request.api_key_index)
 
                     raise HTTPException(status_code=400, detail=error)
 
@@ -949,11 +875,6 @@ async def sign_modify_order(request: SignModifyOrderRequest):
         raise
     except Exception as e:
         logging.error(f"Error in sign_modify_order: {e}")
-        # Rollback nonce on unexpected error
-        try:
-            await nonce_manager.acknowledge_failure(request.account_index, request.api_key_index)
-        except:
-            pass
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -1010,12 +931,6 @@ async def sign_transfer(request: SignTransferRequest):
                 error = result.err.decode("utf-8") if result.err else None
 
                 if error:
-                    # Check for nonce-related errors
-                    if "invalid nonce" in error.lower() or "nonce" in error.lower():
-                        logging.warning(f"Nonce error detected in sign_transfer: {error}")
-                        await nonce_manager.hard_refresh_nonce(request.account_index, request.api_key_index)
-                    else:
-                        await nonce_manager.acknowledge_failure(request.account_index, request.api_key_index)
 
                     raise HTTPException(status_code=400, detail=error)
 
@@ -1033,11 +948,6 @@ async def sign_transfer(request: SignTransferRequest):
         raise
     except Exception as e:
         logging.error(f"Error in sign_transfer: {e}")
-        # Rollback nonce on unexpected error
-        try:
-            await nonce_manager.acknowledge_failure(request.account_index, request.api_key_index)
-        except:
-            pass
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -1092,12 +1002,6 @@ async def sign_create_public_pool(request: SignCreatePublicPoolRequest):
                 error = result.err.decode("utf-8") if result.err else None
 
                 if error:
-                    # Check for nonce-related errors
-                    if "invalid nonce" in error.lower() or "nonce" in error.lower():
-                        logging.warning(f"Nonce error detected in sign_create_public_pool: {error}")
-                        await nonce_manager.hard_refresh_nonce(request.account_index, request.api_key_index)
-                    else:
-                        await nonce_manager.acknowledge_failure(request.account_index, request.api_key_index)
 
                     raise HTTPException(status_code=400, detail=error)
 
@@ -1106,11 +1010,6 @@ async def sign_create_public_pool(request: SignCreatePublicPoolRequest):
         raise
     except Exception as e:
         logging.error(f"Error in sign_create_public_pool: {e}")
-        # Rollback nonce on unexpected error
-        try:
-            await nonce_manager.acknowledge_failure(request.account_index, request.api_key_index)
-        except:
-            pass
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -1167,12 +1066,6 @@ async def sign_update_public_pool(request: SignUpdatePublicPoolRequest):
                 error = result.err.decode("utf-8") if result.err else None
 
                 if error:
-                    # Check for nonce-related errors
-                    if "invalid nonce" in error.lower() or "nonce" in error.lower():
-                        logging.warning(f"Nonce error detected in sign_update_public_pool: {error}")
-                        await nonce_manager.hard_refresh_nonce(request.account_index, request.api_key_index)
-                    else:
-                        await nonce_manager.acknowledge_failure(request.account_index, request.api_key_index)
 
                     raise HTTPException(status_code=400, detail=error)
 
@@ -1181,11 +1074,6 @@ async def sign_update_public_pool(request: SignUpdatePublicPoolRequest):
         raise
     except Exception as e:
         logging.error(f"Error in sign_update_public_pool: {e}")
-        # Rollback nonce on unexpected error
-        try:
-            await nonce_manager.acknowledge_failure(request.account_index, request.api_key_index)
-        except:
-            pass
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -1238,12 +1126,6 @@ async def sign_mint_shares(request: SignMintSharesRequest):
                 error = result.err.decode("utf-8") if result.err else None
 
                 if error:
-                    # Check for nonce-related errors
-                    if "invalid nonce" in error.lower() or "nonce" in error.lower():
-                        logging.warning(f"Nonce error detected in sign_mint_shares: {error}")
-                        await nonce_manager.hard_refresh_nonce(request.account_index, request.api_key_index)
-                    else:
-                        await nonce_manager.acknowledge_failure(request.account_index, request.api_key_index)
 
                     raise HTTPException(status_code=400, detail=error)
 
@@ -1252,11 +1134,6 @@ async def sign_mint_shares(request: SignMintSharesRequest):
         raise
     except Exception as e:
         logging.error(f"Error in sign_mint_shares: {e}")
-        # Rollback nonce on unexpected error
-        try:
-            await nonce_manager.acknowledge_failure(request.account_index, request.api_key_index)
-        except:
-            pass
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -1309,12 +1186,6 @@ async def sign_burn_shares(request: SignBurnSharesRequest):
                 error = result.err.decode("utf-8") if result.err else None
 
                 if error:
-                    # Check for nonce-related errors
-                    if "invalid nonce" in error.lower() or "nonce" in error.lower():
-                        logging.warning(f"Nonce error detected in sign_burn_shares: {error}")
-                        await nonce_manager.hard_refresh_nonce(request.account_index, request.api_key_index)
-                    else:
-                        await nonce_manager.acknowledge_failure(request.account_index, request.api_key_index)
 
                     raise HTTPException(status_code=400, detail=error)
 
@@ -1323,11 +1194,6 @@ async def sign_burn_shares(request: SignBurnSharesRequest):
         raise
     except Exception as e:
         logging.error(f"Error in sign_burn_shares: {e}")
-        # Rollback nonce on unexpected error
-        try:
-            await nonce_manager.acknowledge_failure(request.account_index, request.api_key_index)
-        except:
-            pass
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -1382,12 +1248,6 @@ async def sign_update_leverage(request: SignUpdateLeverageRequest):
                 error = result.err.decode("utf-8") if result.err else None
 
                 if error:
-                    # Check for nonce-related errors
-                    if "invalid nonce" in error.lower() or "nonce" in error.lower():
-                        logging.warning(f"Nonce error detected in sign_update_leverage: {error}")
-                        await nonce_manager.hard_refresh_nonce(request.account_index, request.api_key_index)
-                    else:
-                        await nonce_manager.acknowledge_failure(request.account_index, request.api_key_index)
 
                     raise HTTPException(status_code=400, detail=error)
 
@@ -1396,11 +1256,6 @@ async def sign_update_leverage(request: SignUpdateLeverageRequest):
         raise
     except Exception as e:
         logging.error(f"Error in sign_update_leverage: {e}")
-        # Rollback nonce on unexpected error
-        try:
-            await nonce_manager.acknowledge_failure(request.account_index, request.api_key_index)
-        except:
-            pass
         raise HTTPException(status_code=500, detail=str(e))
 
 
