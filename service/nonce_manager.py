@@ -77,14 +77,6 @@ class NonceManager:
         # Simply return client's value - no cache, no auto-increment, no interference
         return provided_nonce
 
-    async def get_current_nonce(self, account_index: int, api_key_index: int) -> int:
-        """
-        Deprecated: No cached nonce available
-
-        Client must fetch nonce from Lighter API.
-        """
-        return -1
-
     def get_account_lock(self, account_index: int, api_key_index: int) -> asyncio.Lock:
         """
         Get or create a lock for a specific (account_index, api_key_index) pair.

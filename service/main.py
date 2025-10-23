@@ -290,6 +290,34 @@ async def _switch_api_key_internal(api_key_index: int):
         raise HTTPException(status_code=400, detail=f"Failed to switch API key: {error_msg}")
 
 
+async def _activate_client_internal(api_key_index: int, account_index: int):
+    """
+    Internal function to activate a specific (api_key_index, account_index) client.
+    Must be called within a lock BEFORE signing operations.
+
+    This ensures the Go library uses the correct client when multiple clients
+    share the same api_key_index but different account_index values.
+    """
+    if not signer:
+        raise HTTPException(status_code=500, detail="Signer not initialized")
+
+    # First switch API key
+    signer.SwitchAPIKey.argtypes = [ctypes.c_int]
+    signer.SwitchAPIKey.restype = ctypes.c_char_p
+    result = signer.SwitchAPIKey(api_key_index)
+    if result:
+        error_msg = result.decode("utf-8")
+        raise HTTPException(status_code=400, detail=f"Failed to switch API key: {error_msg}")
+
+    # Then verify/activate the specific client
+    signer.CheckClient.argtypes = [ctypes.c_int, ctypes.c_longlong]
+    signer.CheckClient.restype = ctypes.c_char_p
+    result = signer.CheckClient(api_key_index, account_index)
+    if result:
+        error_msg = result.decode("utf-8")
+        raise HTTPException(status_code=400, detail=f"Client not found or invalid: {error_msg}")
+
+
 @app.get("/health")
 async def health_check():
     """Simple health check endpoint to test CORS"""
@@ -400,7 +428,7 @@ async def switch_api_key(request: SwitchApiKeyRequest):
     """
     try:
         async with global_signer_lock:
-            await _switch_api_key_internal(request.api_key_index)
+            await _activate_client_internal(request.api_key_index, request.account_index)
             return {"message": "API key switched successfully"}
     except HTTPException:
         raise
@@ -475,7 +503,7 @@ async def sign_change_api_key(request: SignChangeApiKeyRequest):
 
             # Acquire global lock to ensure atomic switch + sign (protects C library calls)
             async with global_signer_lock:
-                await _switch_api_key_internal(request.api_key_index)
+                await _activate_client_internal(request.api_key_index, request.account_index)
 
                 signer.SignChangePubKey.argtypes = [
                     ctypes.c_char_p,
@@ -549,7 +577,7 @@ async def sign_create_order(request: SignCreateOrderRequest):
 
             # Acquire global lock to ensure atomic switch + sign (protects C library calls)
             async with global_signer_lock:
-                await _switch_api_key_internal(request.api_key_index)
+                await _activate_client_internal(request.api_key_index, request.account_index)
 
                 signer.SignCreateOrder.argtypes = [
                     ctypes.c_int,
@@ -626,7 +654,7 @@ async def sign_cancel_order(request: SignCancelOrderRequest):
 
             # Acquire global lock to ensure atomic switch + sign (protects C library calls)
             async with global_signer_lock:
-                await _switch_api_key_internal(request.api_key_index)
+                await _activate_client_internal(request.api_key_index, request.account_index)
 
                 signer.SignCancelOrder.argtypes = [
                     ctypes.c_int,
@@ -682,7 +710,7 @@ async def sign_withdraw(request: SignWithdrawRequest):
 
             # Acquire global lock to ensure atomic switch + sign (protects C library calls)
             async with global_signer_lock:
-                await _switch_api_key_internal(request.api_key_index)
+                await _activate_client_internal(request.api_key_index, request.account_index)
 
                 signer.SignWithdraw.argtypes = [ctypes.c_longlong, ctypes.c_longlong]
                 signer.SignWithdraw.restype = StrOrErr
@@ -734,7 +762,7 @@ async def sign_create_sub_account(request: SignCreateSubAccountRequest):
 
             # Acquire global lock to ensure atomic switch + sign (protects C library calls)
             async with global_signer_lock:
-                await _switch_api_key_internal(request.api_key_index)
+                await _activate_client_internal(request.api_key_index, request.account_index)
 
                 signer.SignCreateSubAccount.argtypes = [ctypes.c_longlong]
                 signer.SignCreateSubAccount.restype = StrOrErr
@@ -786,7 +814,7 @@ async def sign_cancel_all_orders(request: SignCancelAllOrdersRequest):
 
             # Acquire global lock to ensure atomic switch + sign (protects C library calls)
             async with global_signer_lock:
-                await _switch_api_key_internal(request.api_key_index)
+                await _activate_client_internal(request.api_key_index, request.account_index)
 
                 signer.SignCancelAllOrders.argtypes = [
                     ctypes.c_int,
@@ -842,7 +870,7 @@ async def sign_modify_order(request: SignModifyOrderRequest):
 
             # Acquire global lock to ensure atomic switch + sign (protects C library calls)
             async with global_signer_lock:
-                await _switch_api_key_internal(request.api_key_index)
+                await _activate_client_internal(request.api_key_index, request.account_index)
 
                 signer.SignModifyOrder.argtypes = [
                     ctypes.c_int,
@@ -908,7 +936,7 @@ async def sign_transfer(request: SignTransferRequest):
 
             # Acquire global lock to ensure atomic switch + sign (protects C library calls)
             async with global_signer_lock:
-                await _switch_api_key_internal(request.api_key_index)
+                await _activate_client_internal(request.api_key_index, request.account_index)
 
                 signer.SignTransfer.argtypes = [
                     ctypes.c_longlong,
@@ -981,7 +1009,7 @@ async def sign_create_public_pool(request: SignCreatePublicPoolRequest):
 
             # Acquire global lock to ensure atomic switch + sign (protects C library calls)
             async with global_signer_lock:
-                await _switch_api_key_internal(request.api_key_index)
+                await _activate_client_internal(request.api_key_index, request.account_index)
 
                 signer.SignCreatePublicPool.argtypes = [
                     ctypes.c_longlong,
@@ -1043,7 +1071,7 @@ async def sign_update_public_pool(request: SignUpdatePublicPoolRequest):
 
             # Acquire global lock to ensure atomic switch + sign (protects C library calls)
             async with global_signer_lock:
-                await _switch_api_key_internal(request.api_key_index)
+                await _activate_client_internal(request.api_key_index, request.account_index)
 
                 signer.SignUpdatePublicPool.argtypes = [
                     ctypes.c_longlong,
@@ -1107,7 +1135,7 @@ async def sign_mint_shares(request: SignMintSharesRequest):
 
             # Acquire global lock to ensure atomic switch + sign (protects C library calls)
             async with global_signer_lock:
-                await _switch_api_key_internal(request.api_key_index)
+                await _activate_client_internal(request.api_key_index, request.account_index)
 
                 signer.SignMintShares.argtypes = [
                     ctypes.c_longlong,
@@ -1167,7 +1195,7 @@ async def sign_burn_shares(request: SignBurnSharesRequest):
 
             # Acquire global lock to ensure atomic switch + sign (protects C library calls)
             async with global_signer_lock:
-                await _switch_api_key_internal(request.api_key_index)
+                await _activate_client_internal(request.api_key_index, request.account_index)
 
                 signer.SignBurnShares.argtypes = [
                     ctypes.c_longlong,
@@ -1227,7 +1255,7 @@ async def sign_update_leverage(request: SignUpdateLeverageRequest):
 
             # Acquire global lock to ensure atomic switch + sign (protects C library calls)
             async with global_signer_lock:
-                await _switch_api_key_internal(request.api_key_index)
+                await _activate_client_internal(request.api_key_index, request.account_index)
 
                 signer.SignUpdateLeverage.argtypes = [
                     ctypes.c_int,
@@ -1270,7 +1298,7 @@ async def create_auth_token(request: CreateAuthTokenRequest):
 
         # Acquire global lock to ensure atomic switch + create
         async with global_signer_lock:
-            await _switch_api_key_internal(request.api_key_index)
+            await _activate_client_internal(request.api_key_index, request.account_index)
 
             signer.CreateAuthToken.argtypes = [ctypes.c_longlong]
             signer.CreateAuthToken.restype = StrOrErr
