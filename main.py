@@ -4,6 +4,9 @@ Lighter Signing Service GUI Client
 A beautiful GUI application to manage the lighter-signing-service HTTP server.
 """
 
+# Application version
+APP_VERSION = "0.1.4"
+
 import customtkinter as ctk
 import os
 import sys
@@ -419,6 +422,14 @@ class LighterSigningServiceGUI(ctk.CTk):
             text_color=("gray40", "gray70")
         )
         self.status_text.pack(side="left")
+
+        self.version_label = ctk.CTkLabel(
+            status_info_frame,
+            text=f"v{APP_VERSION}",
+            font=ctk.CTkFont(size=13, weight="bold"),
+            text_color=("#818CF8", "#818CF8")
+        )
+        self.version_label.pack(side="right", padx=(0, 10))
 
         self.port_label = ctk.CTkLabel(
             status_info_frame,
@@ -994,7 +1005,7 @@ class LighterSigningServiceGUI(ctk.CTk):
                 text_color=("#52C41A", "#52C41A")
             )
             self.status_text.configure(text="服务运行中")
-            self.start_button.configure(state="disabled")
+            self.start_button.configure(state="disabled", text="✓  已启动")
             self.stop_button.configure(state="normal")
         else:
             self.status_indicator.configure(

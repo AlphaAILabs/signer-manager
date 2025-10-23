@@ -19,9 +19,12 @@ from service.nonce_manager import nonce_manager
 
 logging.basicConfig(level=logging.DEBUG)
 
+# Version number - update this for each release
+VERSION = "0.1.4"
+
 app = FastAPI(
     title="Lighter Signing Service (Thread-Safe with Global Lock)",
-    version="3.0.0",
+    version=VERSION,
     docs_url="/docs",
     redoc_url="/redoc"
 )
@@ -332,12 +335,17 @@ async def _activate_client_internal(api_key_index: int, account_index: int):
 
 @app.get("/health")
 async def health_check():
-    """Simple health check endpoint to test CORS"""
+    """Health check endpoint with version information"""
+    signer_status = "initialized" if signer else "failed"
     return {
-        "status": "ok",
+        "status": "healthy" if signer else "degraded",
         "service": "Lighter Signing Service",
-        "version": "3.0.0",
-        "signer_initialized": signer is not None
+        "version": VERSION,
+        "thread_safe": True,
+        "lock_type": "global_outermost",
+        "signer": signer_status,
+        "platform": f"{platform.system()}/{platform.machine()}",
+        "note": "All Go SDK operations are serialized for safety"
     }
 
 
@@ -1349,20 +1357,6 @@ async def create_auth_token(request: CreateAuthTokenRequest):
     except Exception as e:
         logging.error(f"Error in create_auth_token: {e}")
         raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.get("/health")
-async def health():
-    signer_status = "initialized" if signer else "failed"
-    return {
-        "status": "healthy" if signer else "degraded",
-        "version": "3.0.0",
-        "thread_safe": True,
-        "lock_type": "global",
-        "signer": signer_status,
-        "platform": f"{platform.system()}/{platform.machine()}",
-        "note": "All signing operations are serialized for safety"
-    }
 
 
 if __name__ == "__main__":
