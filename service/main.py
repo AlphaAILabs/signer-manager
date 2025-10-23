@@ -116,8 +116,10 @@ except Exception as e:
     signer = None
 
 # Store client configurations and private keys
-clients = {}
-api_key_dict = {}  # Store api_key_index -> private_key mapping
+# CRITICAL: We must store full config to recreate clients on demand
+# because Go SDK's backupTxClients[api_key_index] can only hold ONE client per api_key_index
+clients = {}  # client_key -> {url, chain_id, api_key_index, account_index, private_key}
+api_key_dict = {}  # Store api_key_index -> private_key mapping (legacy, may have conflicts)
 
 # Global lock to ensure thread safety for Go SDK
 # CRITICAL: The underlying Go library (lighter-go sharedlib.go) is NOT thread-safe:
@@ -308,29 +310,54 @@ async def _switch_api_key_internal(api_key_index: int):
 async def _activate_client_internal(api_key_index: int, account_index: int):
     """
     Internal function to activate a specific (api_key_index, account_index) client.
-    Must be called within a lock BEFORE signing operations.
+    Must be called within global_signer_lock BEFORE signing operations.
 
-    This ensures the Go library uses the correct client when multiple clients
-    share the same api_key_index but different account_index values.
+    CRITICAL FIX for Go SDK limitation:
+    - Go SDK's backupTxClients[api_key_index] can only store ONE TxClient per api_key_index
+    - When multiple accounts use the same api_key_index, we must RECREATE the correct client
+      each time before signing
+    - This is safe because we hold global_signer_lock (all operations are serialized)
     """
     if not signer:
         raise HTTPException(status_code=500, detail="Signer not initialized")
 
-    # First switch API key
-    signer.SwitchAPIKey.argtypes = [ctypes.c_int]
-    signer.SwitchAPIKey.restype = ctypes.c_char_p
-    result = signer.SwitchAPIKey(api_key_index)
-    if result:
-        error_msg = result.decode("utf-8")
-        raise HTTPException(status_code=400, detail=f"Failed to switch API key: {error_msg}")
+    # Get client config from Python storage
+    client_key = get_client_key(api_key_index, account_index)
+    if client_key not in clients:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Client not found for api_key={api_key_index}, account={account_index}. Call /create_client first."
+        )
 
-    # Then verify/activate the specific client
-    signer.CheckClient.argtypes = [ctypes.c_int, ctypes.c_longlong]
-    signer.CheckClient.restype = ctypes.c_char_p
-    result = signer.CheckClient(api_key_index, account_index)
-    if result:
-        error_msg = result.decode("utf-8")
-        raise HTTPException(status_code=400, detail=f"Client not found or invalid: {error_msg}")
+    client_config = clients[client_key]
+
+    logging.debug(f"Recreating client for api_key={api_key_index}, account={account_index}")
+
+    # CRITICAL: Recreate the client to ensure correct (api_key, account) combination
+    # This overwrites backupTxClients[api_key_index] with the correct account's client
+    signer.CreateClient.argtypes = [
+        ctypes.c_char_p,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_longlong,
+    ]
+    signer.CreateClient.restype = ctypes.c_char_p
+
+    err = signer.CreateClient(
+        client_config["url"].encode("utf-8"),
+        client_config["private_key"].encode("utf-8"),
+        client_config["chain_id"],
+        api_key_index,
+        account_index,
+    )
+
+    if err:
+        error_msg = err.decode("utf-8")
+        logging.error(f"Failed to recreate client for api_key={api_key_index}, account={account_index}: {error_msg}")
+        raise HTTPException(status_code=500, detail=f"Failed to activate client: {error_msg}")
+
+    logging.debug(f"✅ Client activated for api_key={api_key_index}, account={account_index}")
 
 
 @app.get("/health")
@@ -398,7 +425,8 @@ async def create_client(request: CreateClientRequest):
                 "url": request.url,
                 "chain_id": chain_id,
                 "api_key_index": request.api_key_index,
-                "account_index": request.account_index
+                "account_index": request.account_index,
+                "private_key": private_key  # Store for recreating client on demand
             }
 
         return {"message": "Client created successfully", "client_key": client_key}
